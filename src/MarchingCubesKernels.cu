@@ -1,0 +1,514 @@
+#include "Commons.cuh"
+#include "MarchingCubesTables.cuh"
+#include <device_launch_parameters.h>
+
+#define EMPTY_SUBGRID -1
+
+__constant__ float isoThreshold = 0.0f;
+
+// --------------------------------------------------------------------------
+// Math Helpers
+// --------------------------------------------------------------------------
+
+__device__ inline float dot2(float2 v) { return dot(make_float3(v.x, v.y, 0), make_float3(v.x, v.y, 0)); }
+__device__ inline float dot2(float3 v) { return dot(v, v); }
+__device__ inline float length(float3 v) { return sqrtf(dot(v, v)); }
+__device__ inline float length(float2 v) { return sqrtf(v.x * v.x + v.y * v.y); }
+__device__ inline float3 abs_f3(float3 v) { return make_float3(fabsf(v.x), fabsf(v.y), fabsf(v.z)); }
+__device__ inline float2 abs_f2(float2 v) { return make_float2(fabsf(v.x), fabsf(v.y)); }
+__device__ inline float2 max_f2(float2 v, float f) { return make_float2(fmaxf(v.x, f), fmaxf(v.y, f)); }
+__device__ inline float2 min_f2(float2 v, float f) { return make_float2(fminf(v.x, f), fminf(v.y, f)); }
+__device__ inline float3 max_f3(float3 v, float f) { return make_float3(fmaxf(v.x, f), fmaxf(v.y, f), fmaxf(v.z, f)); }
+__device__ inline float3 min_f3(float3 v, float f) { return make_float3(fminf(v.x, f), fminf(v.y, f), fminf(v.z, f)); }
+__device__ inline float3 max_f3(float3 a, float3 b) { return make_float3(fmaxf(a.x, b.x), fmaxf(a.y, b.y), fmaxf(a.z, b.z)); }
+
+__device__ inline float3 mix(float3 a, float3 b, float t) {
+    return make_float3(a.x * (1.0f - t) + b.x * t, a.y * (1.0f - t) + b.y * t, a.z * (1.0f - t) + b.z * t);
+}
+
+// --------------------------------------------------------------------------
+// SDF Primitives
+// --------------------------------------------------------------------------
+
+__device__ float sdSphere(float3 p, float r) {
+    return length(p) - r;
+}
+
+__device__ float sdBox(float3 p, float3 b) {
+    float3 q = abs_f3(p) - b;
+    return length(max_f3(q, 0.0f)) + fminf(fmaxf(q.x, fmaxf(q.y, q.z)), 0.0f);
+}
+
+__device__ float sdTorus(float3 p, float r1, float r2) {
+    float2 q = make_float2(length(make_float2(p.x, p.z)) - r1, p.y);
+    return length(q) - r2;
+}
+
+__device__ float sdCylinder(float3 p, float h, float r) {
+    float2 d = abs_f2(make_float2(length(make_float2(p.x, p.z)), p.y)) - make_float2(r, h);
+    return fminf(fmaxf(d.x, d.y), 0.0f) + length(max_f3(make_float3(d.x, d.y, 0.0f), 0.0f));
+}
+
+__device__ float sdCapsule(float3 p, float h, float r) {
+    p.y -= clamp(p.y, 0.0f, h);
+    return length(p) - r;
+}
+
+__device__ float sdCone(float3 p, float h, float angle) {
+    float2 c = make_float2(sinf(angle * 0.0174533f), cosf(angle * 0.0174533f));
+    float2 q_u = make_float2(h * (c.x/c.y), -h);
+    float2 pXZ = make_float2(p.x, p.z);
+    float2 w_u = make_float2(length(pXZ), p.y);
+    float dot_wq = w_u.x * q_u.x + w_u.y * q_u.y;
+    float dot_qq = q_u.x * q_u.x + q_u.y * q_u.y;
+    float t = clamp(dot_wq / dot_qq, 0.0f, 1.0f);
+    float2 a = w_u - make_float2(q_u.x * t, q_u.y * t);
+    float t_b = clamp(w_u.x / q_u.x, 0.0f, 1.0f);
+    float2 b = w_u - make_float2(q_u.x * t_b, q_u.y);
+    float k = (q_u.y > 0) ? 1.0f : -1.0f;
+    float d = fminf(dot2(a), dot2(b));
+    float s = fmaxf(k * (w_u.x * q_u.y - w_u.y * q_u.x), k * (w_u.y - q_u.y));
+    return sqrtf(d) * (s > 0.0f ? 1.0f : -1.0f);
+}
+
+__device__ float sdRoundedBox(float3 p, float3 b, float r) {
+    float3 q = abs_f3(p) - b;
+    return length(max_f3(q, 0.0f)) + fminf(fmaxf(q.x, fmaxf(q.y, q.z)), 0.0f) - r;
+}
+
+__device__ float sdEllipsoid(float3 p, float3 r) {
+    float k0 = length(make_float3(p.x / r.x, p.y / r.y, p.z / r.z));
+    float k1 = length(make_float3(p.x / (r.x * r.x), p.y / (r.y * r.y), p.z / (r.z * r.z)));
+    return k0 * (k0 - 1.0f) / k1;
+}
+
+__device__ float sdOctahedron(float3 p, float s) {
+    p = abs_f3(p);
+    return (p.x + p.y + p.z - s) * 0.57735027f;
+}
+
+__device__ float sdTriPrism(float3 p, float2 h) {
+    float3 q = abs_f3(p);
+    return fmaxf(q.z - h.y, fmaxf(q.x * 0.866025f + p.y * 0.5f, -p.y) - h.x * 0.5f);
+}
+
+__device__ float sdRoundedCone(float3 p, float h, float r1, float r2) {
+    float2 q = make_float2(length(make_float2(p.x, p.z)), p.y);
+    float b = (r1 - r2) / h;
+    float a = sqrtf(1.0f - b * b);
+    float k = q.x * (-b) + q.y * a; 
+    if (k < 0.0f) return length(q) - r1;
+    if (k > a * h) return length(q - make_float2(0.0f, h)) - r2;
+    return (q.x * a + q.y * b) - r1; 
+}
+
+__device__ float sdRoundedCylinder(float3 p, float h, float r1, float r2) {
+    float2 d = make_float2(length(make_float2(p.x, p.z)) - 2.0f * r1 + r2, fabsf(p.y) - h);
+    return fminf(fmaxf(d.x, d.y), 0.0f) + length(max_f2(d, 0.0f)) - r2;
+}
+
+__device__ float sdHexPrism(float3 p, float2 h) {
+    const float3 k = make_float3(-0.8660254f, 0.5f, 0.57735027f);
+    p = abs_f3(p);
+    float2 p_xz = make_float2(p.x, p.z);
+    float dot_k_p = k.x * p_xz.x + k.y * p_xz.y;
+    float2 k_xy = make_float2(k.x, k.y);
+    float2 offset = k_xy * 2.0f * fminf(dot_k_p, 0.0f);
+    p_xz = p_xz - offset;
+    float2 d = make_float2(
+        length(p_xz - make_float2(clamp(p_xz.x, -k.z * h.x, k.z * h.x), h.x)) * copysignf(1.0f, p_xz.y - h.x),
+        p.y - h.y
+    );
+    return fminf(fmaxf(d.x, d.y), 0.0f) + length(max_f2(d, 0.0f));
+}
+
+// --------------------------------------------------------------------------
+// Operations & Displacements
+// --------------------------------------------------------------------------
+
+__device__ float opUnion(float d1, float d2) { return fminf(d1, d2); }
+__device__ float opSubtract(float d1, float d2) { return fmaxf(d1, -d2); }
+__device__ float opIntersect(float d1, float d2) { return fmaxf(d1, d2); }
+
+__device__ float3 dispTwist(float3 p, float k) {
+    float c = cosf(k * p.y);
+    float s = sinf(k * p.y);
+    float px = c * p.x - s * p.z;
+    float pz = s * p.x + c * p.z;
+    return make_float3(px, p.y, pz);
+}
+
+__device__ float3 dispBend(float3 p, float k) {
+    float c = cosf(k * p.x);
+    float s = sinf(k * p.x);
+    float px = c * p.x - s * p.y;
+    float py = s * p.x + c * p.y;
+    return make_float3(px, py, p.z);
+}
+
+// --------------------------------------------------------------------------
+// SDF Evaluation
+// --------------------------------------------------------------------------
+
+__device__ bool intersectAABB(float3 p, float3 minB, float3 maxB, float min_d) {
+    float3 d = max_f3(max_f3(minB - p, p - maxB), 0.0f);
+    float dist = length(d);
+    return dist < min_d;
+}
+
+__device__ void map(float3 p_world, const SDFGrid& grid, float time, float& outDist, float3& outColor) {
+    float d = 1e10f;
+    float3 color = make_float3(0.0f, 0.0f, 0.0f);
+
+    // BVH Traversal
+    int stack[64];
+    int stackPtr = 0;
+    stack[stackPtr++] = 0; // Root
+    
+    int iter = 0;
+    while (stackPtr > 0 && iter < 256) {
+        iter++;
+        int nodeIdx = stack[--stackPtr];
+        BVHNode node = grid.d_bvhNodes[nodeIdx];
+        
+        float3 nodeMin = make_float3(node.min[0], node.min[1], node.min[2]);
+        float3 nodeMax = make_float3(node.max[0], node.max[1], node.max[2]);
+        
+        if (!intersectAABB(p_world, nodeMin, nodeMax, d)) continue;
+        
+        if (node.right == -1) { // Leaf
+            int i = node.left;
+            SDFPrimitive prim = grid.d_primitives[i];
+            
+            // Transform World -> Local
+            float3 p = p_world - prim.position;
+            p = invRotateVector(p, prim.rotation);
+            p = make_float3(p.x / prim.scale.x, p.y / prim.scale.y, p.z / prim.scale.z);
+            
+            if (prim.displacement == DISP_TWIST) p = dispTwist(p, prim.dispParams[0]);
+            else if (prim.displacement == DISP_BEND) p = dispBend(p, prim.dispParams[0]);
+            else if (prim.displacement == DISP_SINE) p.y += sinf(p.x * prim.dispParams[0] + time) * prim.dispParams[1];
+            
+            float d_prim = 1e10f;
+            switch(prim.type) {
+                case SDF_SPHERE: d_prim = sdSphere(p, prim.params[0]); break;
+                case SDF_BOX: d_prim = sdBox(p, make_float3(prim.params[0], prim.params[1], prim.params[2])); break;
+                case SDF_TORUS: d_prim = sdTorus(p, prim.params[0], prim.params[1]); break;
+                case SDF_CYLINDER: d_prim = sdCylinder(p, prim.params[0], prim.params[1]); break;
+                case SDF_CAPSULE: d_prim = sdCapsule(p, prim.params[0], prim.params[1]); break;
+                case SDF_CONE: d_prim = sdCone(p, prim.params[0], prim.params[1]); break;
+                case SDF_ROUNDED_BOX: d_prim = sdRoundedBox(p, make_float3(prim.params[0], prim.params[1], prim.params[2]), prim.params[3]); break;
+                case SDF_ELLIPSOID: d_prim = sdEllipsoid(p, make_float3(prim.params[0], prim.params[1], prim.params[2])); break;
+                case SDF_OCTOHEDRON: d_prim = sdOctahedron(p, prim.params[0]); break;
+                case SDF_TRIANGULAR_PRISM: d_prim = sdTriPrism(p, make_float2(prim.params[0], prim.params[1])); break;
+                case SDF_ROUNDED_CYLINDER: d_prim = sdRoundedCylinder(p, prim.params[0], prim.params[1], prim.params[2]); break;
+                case SDF_ROUNDED_CONE: d_prim = sdRoundedCone(p, prim.params[0], prim.params[1], prim.params[2]); break;
+                case SDF_HEX_PRISM: d_prim = sdHexPrism(p, make_float2(prim.params[0], prim.params[1])); break;
+                default: d_prim = length(p) - 1.0f; break;
+            }
+            
+            d_prim *= fminf(prim.scale.x, fminf(prim.scale.y, prim.scale.z));
+
+            if (prim.annular > 0.0f) d_prim = fabsf(d_prim) - prim.annular;
+            if (prim.rounding > 0.0f) d_prim -= prim.rounding;
+
+            if (d == 1e10f) {
+                d = d_prim;
+                color = prim.color;
+            } else {
+                float h = 0.0f;
+                switch(prim.operation) {
+                    case SDF_UNION:
+                        if (d_prim < d) { d = d_prim; color = prim.color; }
+                        break;
+                    case SDF_SUBTRACT:
+                        d = opSubtract(d, d_prim);
+                        if (-d_prim > d) color = prim.color; 
+                        break;
+                    case SDF_INTERSECT:
+                        if (d_prim > d) { d = d_prim; color = prim.color; }
+                        break;
+                    case SDF_UNION_BLEND:
+                        h = clamp(0.5f + 0.5f * (d - d_prim) / prim.blendFactor, 0.0f, 1.0f);
+                        d = mix(d, d_prim, h) - prim.blendFactor * h * (1.0f - h);
+                        color = mix(color, prim.color, h);
+                        break;
+                    case SDF_SUBTRACT_BLEND:
+                        h = clamp(0.5f - 0.5f * (d + d_prim) / prim.blendFactor, 0.0f, 1.0f);
+                        d = mix(d, -d_prim, h) + prim.blendFactor * h * (1.0f - h);
+                        color = mix(color, prim.color, h);
+                        break;
+                    case SDF_INTERSECT_BLEND:
+                        h = clamp(0.5f - 0.5f * (d - d_prim) / prim.blendFactor, 0.0f, 1.0f);
+                        d = mix(d, d_prim, h) + prim.blendFactor * h * (1.0f - h);
+                        color = mix(color, prim.color, h);
+                        break;
+                }
+            }
+        } else {
+            stack[stackPtr++] = node.right;
+            stack[stackPtr++] = node.left;
+        }
+    }
+    
+    // Global Primitives (Non-Union)
+    for (int i = grid.numBVHPrimitives; i < grid.numPrimitives; ++i) {
+        SDFPrimitive prim = grid.d_primitives[i];
+        // ... same logic as above ... 
+        // Simplified reuse to save tokens/lines, assumes identical logic
+        float3 p = p_world - prim.position;
+        p = invRotateVector(p, prim.rotation);
+        p = make_float3(p.x / prim.scale.x, p.y / prim.scale.y, p.z / prim.scale.z);
+        
+        if (prim.displacement == DISP_TWIST) p = dispTwist(p, prim.dispParams[0]);
+        else if (prim.displacement == DISP_BEND) p = dispBend(p, prim.dispParams[0]);
+        else if (prim.displacement == DISP_SINE) p.y += sinf(p.x * prim.dispParams[0] + time) * prim.dispParams[1];
+        
+        float d_prim = 1e10f;
+        switch(prim.type) {
+            case SDF_SPHERE: d_prim = sdSphere(p, prim.params[0]); break;
+            case SDF_BOX: d_prim = sdBox(p, make_float3(prim.params[0], prim.params[1], prim.params[2])); break;
+            case SDF_TORUS: d_prim = sdTorus(p, prim.params[0], prim.params[1]); break;
+            case SDF_CYLINDER: d_prim = sdCylinder(p, prim.params[0], prim.params[1]); break;
+            case SDF_CAPSULE: d_prim = sdCapsule(p, prim.params[0], prim.params[1]); break;
+            case SDF_CONE: d_prim = sdCone(p, prim.params[0], prim.params[1]); break;
+            case SDF_ROUNDED_BOX: d_prim = sdRoundedBox(p, make_float3(prim.params[0], prim.params[1], prim.params[2]), prim.params[3]); break;
+            case SDF_ELLIPSOID: d_prim = sdEllipsoid(p, make_float3(prim.params[0], prim.params[1], prim.params[2])); break;
+            case SDF_OCTOHEDRON: d_prim = sdOctahedron(p, prim.params[0]); break;
+            case SDF_TRIANGULAR_PRISM: d_prim = sdTriPrism(p, make_float2(prim.params[0], prim.params[1])); break;
+            case SDF_ROUNDED_CYLINDER: d_prim = sdRoundedCylinder(p, prim.params[0], prim.params[1], prim.params[2]); break;
+            case SDF_ROUNDED_CONE: d_prim = sdRoundedCone(p, prim.params[0], prim.params[1], prim.params[2]); break;
+            case SDF_HEX_PRISM: d_prim = sdHexPrism(p, make_float2(prim.params[0], prim.params[1])); break;
+            default: d_prim = length(p) - 1.0f; break;
+        }
+        d_prim *= fminf(prim.scale.x, fminf(prim.scale.y, prim.scale.z));
+        if (prim.annular > 0.0f) d_prim = fabsf(d_prim) - prim.annular;
+        if (prim.rounding > 0.0f) d_prim -= prim.rounding;
+
+        if (d == 1e10f) { d = d_prim; color = prim.color; }
+        else {
+            float h = 0.0f;
+            switch(prim.operation) {
+                case SDF_UNION: if (d_prim < d) { d = d_prim; color = prim.color; } break;
+                case SDF_SUBTRACT: d = opSubtract(d, d_prim); if (-d_prim > d) color = prim.color; break;
+                case SDF_INTERSECT: if (d_prim > d) { d = d_prim; color = prim.color; } break;
+                case SDF_UNION_BLEND:
+                    h = clamp(0.5f + 0.5f * (d - d_prim) / prim.blendFactor, 0.0f, 1.0f);
+                    d = mix(d, d_prim, h) - prim.blendFactor * h * (1.0f - h);
+                    color = mix(color, prim.color, h); break;
+                case SDF_SUBTRACT_BLEND:
+                    h = clamp(0.5f - 0.5f * (d + d_prim) / prim.blendFactor, 0.0f, 1.0f);
+                    d = mix(d, -d_prim, h) + prim.blendFactor * h * (1.0f - h);
+                    color = mix(color, prim.color, h); break;
+                case SDF_INTERSECT_BLEND:
+                    h = clamp(0.5f - 0.5f * (d - d_prim) / prim.blendFactor, 0.0f, 1.0f);
+                    d = mix(d, d_prim, h) + prim.blendFactor * h * (1.0f - h);
+                    color = mix(color, prim.color, h); break;
+            }
+        }
+    }
+    outDist = d;
+    outColor = color;
+}
+
+// --------------------------------------------------------------------------
+// Scout Kernel
+// --------------------------------------------------------------------------
+
+__global__ void scoutActiveBlocks(SDFGrid grid, float time) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalBlocks = grid.blocksDim.x * grid.blocksDim.y * grid.blocksDim.z;
+    
+    if (idx >= totalBlocks) return;
+    
+    // Block Coord
+    int bx = idx % grid.blocksDim.x;
+    int temp = idx / grid.blocksDim.x;
+    int by = temp % grid.blocksDim.y;
+    int bz = temp / grid.blocksDim.y;
+    
+    // Center of the block
+    // The block covers range [b * size, (b+1)*size] in voxel coords
+    // Center voxel coord ~ b*size + size/2
+    float3 centerVoxel = make_float3(
+        (bx * SDF_BLOCK_SIZE + SDF_BLOCK_SIZE * 0.5f) * grid.cellSize + grid.origin.x,
+        (by * SDF_BLOCK_SIZE + SDF_BLOCK_SIZE * 0.5f) * grid.cellSize + grid.origin.y,
+        (bz * SDF_BLOCK_SIZE + SDF_BLOCK_SIZE * 0.5f) * grid.cellSize + grid.origin.z
+    );
+    
+    // Bounding Radius
+    // Radius of cube = half_diag = (size/2) * sqrt(3)
+    // Add buffer for interpolation (1-2 voxels)
+    float r = (SDF_BLOCK_SIZE * 0.5f * 1.73205f + 2.0f) * grid.cellSize;
+    
+    float d;
+    float3 c;
+    map(centerVoxel, grid, time, d, c);
+    
+    if (fabsf(d) <= r) {
+        int id = atomicAdd(grid.d_activeBlockCount, 1);
+        if (id < grid.maxBlocks) {
+            grid.d_activeBlocks[id] = idx;
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// Active Block Processing
+// --------------------------------------------------------------------------
+
+__device__ int4 getGlobalCoordsFromBlock(int blockIdx, int tid, const SDFGrid& grid) {
+    // blockIdx is the ID in d_activeBlocks list, not the linear index
+    // Wait, no, we pass the linear block ID to this function usually?
+    // Let's say blockID is the linear index (bx + by*w + ...)
+    
+    int bx = blockIdx % grid.blocksDim.x;
+    int temp = blockIdx / grid.blocksDim.x;
+    int by = temp % grid.blocksDim.y;
+    int bz = temp / grid.blocksDim.y;
+    
+    // Local ID in block
+    int lz = tid / (SDF_BLOCK_SIZE * SDF_BLOCK_SIZE);
+    int trem = tid % (SDF_BLOCK_SIZE * SDF_BLOCK_SIZE);
+    int ly = trem / SDF_BLOCK_SIZE;
+    int lx = trem % SDF_BLOCK_SIZE;
+    
+    return make_int4(bx * SDF_BLOCK_SIZE + lx, by * SDF_BLOCK_SIZE + ly, bz * SDF_BLOCK_SIZE + lz, 0);
+}
+
+__global__ void countActiveBlockTriangles(SDFGrid grid, float time) {
+    int activeBlockId = blockIdx.x;
+    if (activeBlockId >= *grid.d_activeBlockCount) return;
+    
+    int blockIndex = grid.d_activeBlocks[activeBlockId];
+    int tid = threadIdx.x; // 0 to 511
+    
+    int4 xyz = getGlobalCoordsFromBlock(blockIndex, tid, grid);
+    
+    // Check boundaries
+    if (outOfBounds(grid, xyz)) {
+        grid.d_packetVertexCounts[activeBlockId * SDF_BLOCK_SIZE_CUBED + tid] = 0;
+        return;
+    }
+
+    // Evaluate 8 corners
+    // Optimization: We could share memory or use warp shuffle, but for now brute force 8 eval
+    // Since we don't have a global SDF grid anymore.
+    
+    // float cubeVal[8]; // Unused in counting
+    int code = 0;
+    
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int dx = marchingCubeCorners[i][0];
+        int dy = marchingCubeCorners[i][1];
+        int dz = marchingCubeCorners[i][2];
+        
+        float3 p = getLocation(grid, make_int4(xyz.x + dx, xyz.y + dy, xyz.z + dz, 0));
+        float d; float3 c;
+        map(p, grid, time, d, c);
+        
+        // cubeVal[i] = d;
+        if (d >= isoThreshold) code |= (1 << i);
+    }
+    
+    int firstIn = firstMarchingCubesId[code];
+    int num = firstMarchingCubesId[code + 1] - firstIn;
+    
+    // Output 3 vertices per triangle
+    grid.d_packetVertexCounts[activeBlockId * SDF_BLOCK_SIZE_CUBED + tid] = num; // num indices
+}
+
+__global__ void generateActiveBlockTriangles(SDFGrid grid, float time) {
+    int activeBlockId = blockIdx.x;
+    if (activeBlockId >= *grid.d_activeBlockCount) return;
+    
+    int blockIndex = grid.d_activeBlocks[activeBlockId];
+    int tid = threadIdx.x;
+    
+    unsigned int first = grid.d_packetVertexOffsets[activeBlockId * SDF_BLOCK_SIZE_CUBED + tid];
+    
+    int4 xyz = getGlobalCoordsFromBlock(blockIndex, tid, grid);
+    if (outOfBounds(grid, xyz)) return;
+    
+    float cubeVal[8];
+    int code = 0;
+    
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int dx = marchingCubeCorners[i][0];
+        int dy = marchingCubeCorners[i][1];
+        int dz = marchingCubeCorners[i][2];
+        
+        float3 p = getLocation(grid, make_int4(xyz.x + dx, xyz.y + dy, xyz.z + dz, 0));
+        float d; float3 c;
+        map(p, grid, time, d, c);
+        
+        cubeVal[i] = d;
+        if (d >= isoThreshold) code |= (1 << i);
+    }
+    
+    int firstIn = firstMarchingCubesId[code];
+    int num = firstMarchingCubesId[code + 1] - firstIn;
+    
+    // Generate Triangles
+    for (int i = 0; i < num; i += 3) {
+        // Triangle i/3
+        int vOutIdx = first + i;
+        
+        if (vOutIdx + 2 >= grid.maxVertices) break;
+        
+        for (int j = 0; j < 3; ++j) {
+            int eid = marchingCubesIds[firstIn + i + j];
+            // int v1 = marchingCubesEdgeLocations[eid][0]; // corner index 1 (unused)
+            // corner index 2 is implicit from edge? 
+            // marchingCubesEdgeLocations stores [dx, dy, dz, edgeAxis]
+            // We need corners.
+            // Let's use standard MC edge table logic
+            // edge 'eid' connects corner A and B
+            
+            // Standard table lookup
+            int c1 = edgeConnections[eid][0];
+            int c2 = edgeConnections[eid][1];
+            
+            float val1 = cubeVal[c1];
+            float val2 = cubeVal[c2];
+            
+            float t = (isoThreshold - val1) / (val2 - val1);
+            t = clamp(t, 0.0f, 1.0f);
+            
+            int4 pos1I = make_int4(
+                xyz.x + marchingCubeCorners[c1][0],
+                xyz.y + marchingCubeCorners[c1][1],
+                xyz.z + marchingCubeCorners[c1][2], 0);
+                
+            int4 pos2I = make_int4(
+                xyz.x + marchingCubeCorners[c2][0],
+                xyz.y + marchingCubeCorners[c2][1],
+                xyz.z + marchingCubeCorners[c2][2], 0);
+            
+            float3 p1 = getLocation(grid, pos1I);
+            float3 p2 = getLocation(grid, pos2I);
+            
+            float3 p = mix(p1, p2, t);
+            
+            // Compute Color/Normal
+            float dist; float3 color;
+            map(p, grid, time, dist, color);
+            
+            // Write Output
+            grid.d_vertices[vOutIdx + j] = make_float4(p.x, p.y, p.z, 1.0f);
+            if (grid.d_vertexColors) {
+                grid.d_vertexColors[vOutIdx + j] = make_float4(color.x, color.y, color.z, 1.0f);
+            }
+        }
+        
+        // No indices needed for triangle soup (glDrawArrays)
+        // Or trivial indices:
+        if (grid.d_indices) {
+            grid.d_indices[vOutIdx] = vOutIdx;
+            grid.d_indices[vOutIdx+1] = vOutIdx+1;
+            grid.d_indices[vOutIdx+2] = vOutIdx+2;
+        }
+    }
+}

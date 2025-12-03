@@ -1,0 +1,452 @@
+#include <glad/glad.h>
+#include <GLFW/glfw3.h>
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <string>
+#include <cuda_runtime.h>
+#include <cuda_gl_interop.h>
+
+#include "Commons.cuh"
+#include "CudaSDFMesh.h"
+#include "CudaSDFUtil.h" // For shader sources and helpers
+
+// Global variables
+const float GRID_SIZE = 128.0f; // Increased resolution
+const float CELL_SIZE = 1.0f/GRID_SIZE;
+const unsigned int WINDOW_WIDTH = 1024;
+const unsigned int WINDOW_HEIGHT = 768;
+
+GLuint shaderProgram;
+GLuint vao, vbo, ibo, cbo;
+struct cudaGraphicsResource* cudaVBO;
+struct cudaGraphicsResource* cudaIBO; // Unused but kept for structure compatibility if needed
+struct cudaGraphicsResource* cudaCBO;
+
+GLuint uboPrimitives; // UBO Handle
+GLuint tboBVH, texBVH; // BVH Texture Buffer
+
+CudaSDFMesh mesh;
+
+void checkGLErrors(const char* label) {
+    GLenum err;
+    while ((err = glGetError()) != GL_NO_ERROR) {
+        std::cerr << "OpenGL Error at " << label << ": " << err << std::endl;
+    }
+}
+
+void checkShaderErrors(GLuint shader, std::string type) {
+    GLint success;
+    GLchar infoLog[1024];
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        glGetShaderInfoLog(shader, 1024, NULL, infoLog);
+        std::cout << "ERROR::SHADER_COMPILATION_ERROR of type: " << type << "\n" << infoLog << "\n -- --------------------------------------------------- -- " << std::endl;
+    }
+}
+
+void checkProgramErrors(GLuint program, std::string type) {
+    GLint success;
+    GLchar infoLog[1024];
+    glGetProgramiv(program, GL_LINK_STATUS, &success);
+    if (!success) {
+        glGetProgramInfoLog(program, 1024, NULL, infoLog);
+        std::cout << "ERROR::PROGRAM_LINKING_ERROR of type: " << type << "\n" << infoLog << "\n -- --------------------------------------------------- -- " << std::endl;
+    }
+}
+
+void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods) {
+    if (action == GLFW_PRESS) {
+        if (key == GLFW_KEY_W) {
+            static bool wireframe = false;
+            wireframe = !wireframe;
+            glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);
+        }
+        if (key == GLFW_KEY_ESCAPE) {
+            glfwSetWindowShouldClose(window, true);
+        }
+    }
+}
+
+void initGL() {
+    glfwInit();
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+    GLFWwindow* window = glfwCreateWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "CUDA Marching Cubes (Sparse)", NULL, NULL);
+    if (window == NULL) {
+        std::cout << "Failed to create GLFW window" << std::endl;
+        glfwTerminate();
+        exit(-1);
+    }
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(0); // Disable VSync
+    glfwSetKeyCallback(window, key_callback);
+
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+        std::cout << "Failed to initialize GLAD" << std::endl;
+        exit(-1);
+    }
+
+    // Initialize CUDA Device from OpenGL Context
+    unsigned int cudaDeviceCount = 0;
+    int cudaDevices[16];
+    cudaError_t cudaErr = cudaGLGetDevices(&cudaDeviceCount, cudaDevices, 16, cudaGLDeviceListAll);
+    
+    if (cudaErr == cudaSuccess && cudaDeviceCount > 0) {
+        std::cout << "Found " << cudaDeviceCount << " CUDA-GL capable devices." << std::endl;
+        // Use the first device
+        cudaSetDevice(cudaDevices[0]);
+        
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, cudaDevices[0]);
+        std::cout << "Selected CUDA Device: " << prop.name << std::endl;
+        
+        // Check if the driver version is sufficient
+        int driverVersion = 0;
+        cudaDriverGetVersion(&driverVersion);
+        std::cout << "CUDA Driver Version: " << driverVersion << std::endl;
+        
+        int runtimeVersion = 0;
+        cudaRuntimeGetVersion(&runtimeVersion);
+        std::cout << "CUDA Runtime Version: " << runtimeVersion << std::endl;
+        
+        if (driverVersion < runtimeVersion) {
+            std::cerr << "Warning: CUDA driver version (" << driverVersion << ") is less than runtime version (" << runtimeVersion << "). This may cause issues." << std::endl;
+        }
+
+    } else {
+        std::cout << "Warning: No CUDA-GL device found via cudaGLGetDevices. Falling back to default device 0." << std::endl;
+        if (cudaErr != cudaSuccess) {
+             std::cout << "cudaGLGetDevices error: " << cudaGetErrorString(cudaErr) << std::endl;
+        }
+        cudaSetDevice(0);
+    }
+    
+    // Build shaders
+    GLuint vertexShader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vertexShader, 1, &vertexShaderSource, NULL);
+    glCompileShader(vertexShader);
+    checkShaderErrors(vertexShader, "VERTEX");
+    
+    GLuint fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fragmentShader, 1, &fragmentShaderSource, NULL);
+    glCompileShader(fragmentShader);
+    checkShaderErrors(fragmentShader, "FRAGMENT");
+    
+    shaderProgram = glCreateProgram();
+    glAttachShader(shaderProgram, vertexShader);
+    glAttachShader(shaderProgram, fragmentShader);
+    glLinkProgram(shaderProgram);
+    checkProgramErrors(shaderProgram, "PROGRAM");
+    
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShader);
+    
+    // Buffers
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
+    glGenBuffers(1, &cbo);
+    glGenBuffers(1, &ibo);
+    
+    glBindVertexArray(vao);
+    
+    // VBO (float4 positions)
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    unsigned int maxVerts = 20000000; // 20M vertices buffer for high res surface
+    glBufferData(GL_ARRAY_BUFFER, maxVerts * sizeof(float) * 4, NULL, GL_DYNAMIC_DRAW);
+    
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+
+    // CBO (float4 colors)
+    glBindBuffer(GL_ARRAY_BUFFER, cbo);
+    glBufferData(GL_ARRAY_BUFFER, maxVerts * sizeof(float) * 4, NULL, GL_DYNAMIC_DRAW);
+    
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(1);
+    
+    // IBO (Unused in Sparse Mode, but allocated to keep interop happy if strictly required, or just small)
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+    unsigned int maxIndices = 1024; 
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, maxIndices * sizeof(unsigned int), NULL, GL_DYNAMIC_DRAW);
+    
+    // Register with CUDA
+    cudaError_t errVBO = cudaGraphicsGLRegisterBuffer(&cudaVBO, vbo, cudaGraphicsRegisterFlagsWriteDiscard);
+    if (errVBO != cudaSuccess) { 
+        std::cerr << "CUDA Error Register VBO: " << cudaGetErrorString(errVBO) << std::endl; 
+        exit(-1); 
+    }
+    cudaError_t errCBO = cudaGraphicsGLRegisterBuffer(&cudaCBO, cbo, cudaGraphicsRegisterFlagsWriteDiscard);
+    if (errCBO != cudaSuccess) { 
+        std::cerr << "CUDA Error Register CBO: " << cudaGetErrorString(errCBO) << std::endl; 
+        exit(-1); 
+    }
+    // if (cudaGraphicsGLRegisterBuffer(&cudaIBO, ibo, cudaGraphicsRegisterFlagsWriteDiscard) != cudaSuccess) { std::cerr << "CUDA Error Register IBO" << std::endl; exit(-1); }
+    
+    glBindVertexArray(0);
+    
+    // Create UBO
+    glGenBuffers(1, &uboPrimitives);
+    glBindBuffer(GL_UNIFORM_BUFFER, uboPrimitives);
+    glBufferData(GL_UNIFORM_BUFFER, sizeof(GPUPrimitive) * 64, NULL, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_UNIFORM_BUFFER, 0);
+    
+    // Create BVH TBO
+    glGenBuffers(1, &tboBVH);
+    glGenTextures(1, &texBVH);
+    glBindBuffer(GL_TEXTURE_BUFFER, tboBVH);
+    // Allocate initial size
+    glBufferData(GL_TEXTURE_BUFFER, 1024 * sizeof(float), NULL, GL_DYNAMIC_DRAW);
+    glBindTexture(GL_TEXTURE_BUFFER, texBVH);
+    glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, tboBVH);
+    glBindBuffer(GL_TEXTURE_BUFFER, 0);
+    glBindTexture(GL_TEXTURE_BUFFER, 0);
+    
+    GLuint blockIndex = glGetUniformBlockIndex(shaderProgram, "Primitives");
+    if(blockIndex != GL_INVALID_INDEX) {
+        glUniformBlockBinding(shaderProgram, blockIndex, 0);
+        glBindBufferBase(GL_UNIFORM_BUFFER, 0, uboPrimitives);
+    } else {
+        std::cout << "Warning: Uniform block 'Primitives' not found" << std::endl;
+    }
+    
+    checkGLErrors("initGL");
+}
+
+int main() {
+    initGL();
+    mesh.Initialize(CELL_SIZE, make_float3(-1.1f, -1.1f, -1.1f), make_float3(1.1f, 1.1f, 1.1f));
+    
+    GLFWwindow* window = glfwGetCurrentContext();
+
+    // Create Scene (Primitives Showcase)
+    std::vector<SDFPrimitive> scenePrimitives;
+    
+    // 1. Torus (green)
+    SDFPrimitive torus = CreateTorusPrim(
+        make_float3(-0.5f, 0.5f, 0.0f),
+        make_float4(0.0f, 0.0f, 0.0f, 1.0f),
+        make_float3(0.2f, 0.8f, 0.2f),
+        SDF_UNION,
+        0.0f,
+        0.4f,
+        0.15f
+    );
+    scenePrimitives.push_back(torus);
+
+    // 2. Hex Prism (Red)(Twisted)
+    SDFPrimitive hex = CreateHexPrismPrim(
+        make_float3(0.5f, 0.5f, 0.0f),
+        make_float4(0.0f, 0.0f, 0.0f, 1.0f),
+        make_float3(1.0f, 0.2f, 0.2f),
+        SDF_UNION,
+        0.0f,
+        0.3f,
+        0.4f
+    );
+    hex.displacement = DISP_TWIST;
+    hex.dispParams[0] = 2.0f; // Initial Twist
+    scenePrimitives.push_back(hex);
+
+    // 3. Rounded Cone (Blue)
+    SDFPrimitive cone = CreateRoundedConePrim(
+        make_float3(-0.5f, -0.5f, 0.0f),
+        make_float4(0.0f, 0.0f, 0.0f, 1.0f),
+        make_float3(0.2f, 0.2f, 1.0f),
+        SDF_UNION,
+        0.0f,
+        0.5f,
+        0.3f,
+        0.1f
+    );
+    scenePrimitives.push_back(cone);
+
+    // 4. Rounded Cylinder (Yellow)
+    SDFPrimitive cyl = CreateRoundedCylinderPrim(
+        make_float3(0.5f, -0.5f, 0.0f),
+        make_float4(0.0f, 0.0f, 0.0f, 1.0f),
+        make_float3(1.0f, 1.0f, 0.2f),
+        SDF_UNION,
+        0.0f,
+        0.4f,
+        0.2f,
+        0.1f
+    );
+    scenePrimitives.push_back(cyl);
+
+    // 5. Sphere (Purple, Subtracted)
+    SDFPrimitive sphere = CreateSpherePrim(
+        make_float3(0.0f, 0.0f, 0.0f),
+        make_float4(0.0f, 0.0f, 0.0f, 1.0f),
+        make_float3(0.5f, 0.0f, 0.5f),
+        SDF_SUBTRACT,
+        0.0f,
+        0.6f
+    );
+    scenePrimitives.push_back(sphere);
+
+    // Upload UBO once (initial)
+    std::vector<GPUPrimitive> gpuPrimitives;
+    packPrimitives(scenePrimitives, gpuPrimitives);
+    glBindBuffer(GL_UNIFORM_BUFFER, uboPrimitives);
+    glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(GPUPrimitive) * gpuPrimitives.size(), gpuPrimitives.data());
+    glBindBuffer(GL_UNIFORM_BUFFER, 0);
+
+    // Matrices
+    float model[16] = {
+        1,0,0,0, 
+        0,1,0,0, 
+        0,0,1,0, 
+        0,0,0,1
+    };
+    
+    float view[16] = {
+        1,0,0,0, 
+        0,1,0,0, 
+        0,0,1,0, 
+        0,0,-3,1 
+    };
+
+    // Standard Perspective Projection
+    float fov = 45.0f * (3.14159f / 180.0f);
+    float aspect = (float)WINDOW_WIDTH / (float)WINDOW_HEIGHT;
+    float zNear = 0.1f;
+    float zFar = 100.0f;
+    float f = 1.0f / tan(fov / 2.0f);
+    
+    float projection[16] = {0};
+    projection[0] = f / aspect;
+    projection[5] = f;
+    projection[10] = (zFar + zNear) / (zNear - zFar);
+    projection[11] = -1.0f;
+    projection[14] = (2.0f * zFar * zNear) / (zNear - zFar);
+
+    glDisable(GL_CULL_FACE); // Disable culling to see both sides
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+
+    double lastFPSTime = glfwGetTime();
+    int frameCount = 0;
+
+    while (!glfwWindowShouldClose(window)) {
+        double currentTime = glfwGetTime();
+        frameCount++;
+        if (currentTime - lastFPSTime >= 1.0) {
+            std::string title = "CUDA Marching Cubes (Sparse) - " + std::to_string(frameCount) + " FPS";
+            glfwSetWindowTitle(window, title.c_str());
+            frameCount = 0;
+            lastFPSTime = currentTime;
+        }
+
+        float time = (float)currentTime;
+        
+        // Print stats every 1 second
+        static float lastPrintTime = 0.0f;
+        if (time - lastPrintTime > 1.0f) {
+            CudaSDFMesh::MemStats stats = mesh.GetMemoryStats();
+            std::cout << "GPU Mem: Used " << (stats.usedGPU / 1024 / 1024) << " MB, Free " << (stats.freeGPU / 1024 / 1024) << " MB | Blocks: " << stats.activeBlocks << "/" << stats.allocatedBlocks << std::endl;
+            lastPrintTime = time;
+        }
+        
+        // Animate Primitives
+        scenePrimitives[0].dispParams[1] = 5.0f * sin(time*0.1f);
+        float c_rot = cos(time), s_rot = sin(time);
+        scenePrimitives[1].rotation = make_float4(0.0f, s_rot, 0.0f, c_rot);
+        scenePrimitives[2].position.y = -0.5f + 0.2f * sin(time * 2.0f);
+        scenePrimitives[3].params[2] = 0.1f + 0.05f * sin(time * 3.0f);
+
+        // Update Mesh
+        mesh.ClearPrimitives();
+        for(const auto& p : scenePrimitives) {
+            mesh.AddPrimitive(p);
+        }
+        
+        // Map GL buffers
+        if (cudaGraphicsMapResources(1, &cudaVBO, 0) != cudaSuccess) break;
+        if (cudaGraphicsMapResources(1, &cudaCBO, 0) != cudaSuccess) break;
+        // if (cudaGraphicsMapResources(1, &cudaIBO, 0) != cudaSuccess) break;
+        
+        float4* d_vboPtr;
+        float4* d_cboPtr;
+        unsigned int* d_iboPtr = nullptr;
+        size_t size;
+        
+        cudaGraphicsResourceGetMappedPointer((void**)&d_vboPtr, &size, cudaVBO);
+        cudaGraphicsResourceGetMappedPointer((void**)&d_cboPtr, &size, cudaCBO);
+        // cudaGraphicsResourceGetMappedPointer((void**)&d_iboPtr, &size, cudaIBO);
+        
+        mesh.Update(time, d_vboPtr, d_cboPtr, d_iboPtr);
+
+        cudaGraphicsUnmapResources(1, &cudaVBO, 0);
+        cudaGraphicsUnmapResources(1, &cudaCBO, 0);
+        // cudaGraphicsUnmapResources(1, &cudaIBO, 0);
+        
+        // Update UBO from Mesh (it might have sorted them)
+        const auto& currentGPUPrimitives = mesh.GetGPUPrimitives();
+        glBindBuffer(GL_UNIFORM_BUFFER, uboPrimitives);
+        glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(GPUPrimitive) * currentGPUPrimitives.size(), currentGPUPrimitives.data());
+        glBindBuffer(GL_UNIFORM_BUFFER, 0);
+        
+        // Update TBO from Mesh
+        const auto& bvhNodes = mesh.GetBVHNodes();
+        glBindBuffer(GL_TEXTURE_BUFFER, tboBVH);
+        std::vector<float> bvhData;
+        bvhData.resize(bvhNodes.size() * 8); 
+        for(size_t i=0; i<bvhNodes.size(); ++i) {
+            bvhData[i*8+0] = bvhNodes[i].min[0];
+            bvhData[i*8+1] = bvhNodes[i].min[1];
+            bvhData[i*8+2] = bvhNodes[i].min[2];
+            bvhData[i*8+3] = bvhNodes[i].max[0];
+            
+            bvhData[i*8+4] = bvhNodes[i].max[1];
+            bvhData[i*8+5] = bvhNodes[i].max[2];
+            
+            int left = bvhNodes[i].left;
+            int right = bvhNodes[i].right;
+            bvhData[i*8+6] = *(float*)&left;
+            bvhData[i*8+7] = *(float*)&right;
+        }
+        glBufferData(GL_TEXTURE_BUFFER, bvhData.size() * sizeof(float), bvhData.data(), GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_TEXTURE_BUFFER, 0);
+        
+        // Render
+        glViewport(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
+        glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_DEPTH_TEST);
+        
+        glUseProgram(shaderProgram);
+        
+        // Set time
+        glUniform1f(glGetUniformLocation(shaderProgram, "time"), time);
+        glUniform1i(glGetUniformLocation(shaderProgram, "uNumBVHPrimitives"), mesh.GetNumBVHPrimitives());
+        glUniform1i(glGetUniformLocation(shaderProgram, "uNumTotalPrimitives"), (int)currentGPUPrimitives.size());
+        
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_BUFFER, texBVH);
+        glUniform1i(glGetUniformLocation(shaderProgram, "bvhNodes"), 0);
+        
+        // Set matrices
+        float c = cos(time), s = sin(time);
+        model[0] = c; model[2] = -s;
+        model[8] = s; model[10] = c;
+        
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, model);
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, view);
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, projection);
+        
+        glBindVertexArray(vao);
+        // Switch to DrawArrays for Triangle Soup
+        glDrawArrays(GL_TRIANGLES, 0, mesh.GetTotalVertexCount());
+        
+        checkGLErrors("draw");
+
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+    }
+
+    // Cleanup
+    glfwTerminate();
+    return 0;
+}
