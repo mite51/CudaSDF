@@ -7,9 +7,9 @@
 #include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
 
-#include "Commons.cuh"
-#include "CudaSDFMesh.h"
-#include "CudaSDFUtil.h" // For shader sources and helpers
+#include "SDFMesh/Commons.cuh"
+#include "SDFMesh/CudaSDFMesh.h"
+#include "SDFMesh/CudaSDFUtil.h" // For shader sources and helpers
 
 // Global variables
 const float GRID_SIZE = 128.0f; // Increased resolution

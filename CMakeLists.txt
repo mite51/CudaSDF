@@ -29,9 +29,9 @@ include_directories(src)
 
 set(SOURCES
     src/main.cpp
-    src/CudaSDFMesh.cpp
-    src/MarchingCubesKernels.cu
-    src/Wrappers.cu
+    src/SDFMesh/CudaSDFMesh.cpp
+    src/SDFMesh/MarchingCubesKernels.cu
+    src/SDFMesh/Wrappers.cu
 )
 
 add_executable(CudaSDF ${SOURCES})
