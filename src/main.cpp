@@ -25,8 +25,12 @@ const unsigned int WINDOW_WIDTH = 1024;
 const unsigned int WINDOW_HEIGHT = 768;
 
 GLuint shaderProgram;
+GLuint projectionShaderProgram; // Shader for projection baking
 GLuint vao, vbo, ibo, cbo, uvbo; // Added uvbo for texture coordinates
-GLuint g_textureID = 0;
+GLuint g_textureID = 0; // Source texture for projection
+GLuint g_bakedTextureID = 0; // Baked texture from projection
+GLuint g_fbo = 0; // Framebuffer for projection baking
+GLuint g_rbo = 0; // Renderbuffer for depth
 
 struct cudaGraphicsResource* cudaVBO;
 struct cudaGraphicsResource* cudaIBO; // Unused but kept for structure compatibility if needed
@@ -37,8 +41,10 @@ GLuint tboBVH, texBVH; // BVH Texture Buffer
 
 CudaSDFMesh mesh;
 bool g_triggerUnwrap = false;
+bool g_triggerProjection = false; // Flag to trigger projection baking
 bool g_AnimateMesh = true; // Flag to control animation/update
 bool g_isUnwrapped = false; // Track if mesh has been unwrapped
+bool g_hasProjectedTexture = false; // Track if texture has been projection baked
 uint32_t g_indexCount = 0; // Number of indices for indexed drawing
 
 void checkGLErrors(const char* label) {
@@ -47,6 +53,79 @@ void checkGLErrors(const char* label) {
         std::cerr << "OpenGL Error at " << label << ": " << err << std::endl;
     }
 }
+
+// Simple projection shader sources
+const char* projectionVertexShader = R"(
+    #version 330 core
+    layout (location = 0) in vec4 aPos;
+    layout (location = 2) in vec2 aTexCoord;
+    
+    uniform mat4 model;
+    uniform mat4 view;
+    uniform mat4 projection;
+    
+    out vec4 worldPos;
+    out vec3 worldNormal;
+    
+    void main() {
+        // Render in UV space - UV coords become the position
+        gl_Position = vec4(aTexCoord.x * 2.0 - 1.0, aTexCoord.y * 2.0 - 1.0, 0.0, 1.0);
+        
+        // Pass world position for projection sampling
+        worldPos = model * vec4(aPos.xyz, 1.0);
+        
+        // Calculate normal from derivatives (will be done per-triangle in fragment shader)
+        worldNormal = vec3(0.0); // Placeholder, will compute in fragment shader
+    }
+)";
+
+const char* projectionFragmentShader = R"(
+    #version 330 core
+    in vec4 worldPos;
+    in vec3 worldNormal;
+    
+    uniform sampler2D sourceTexture;
+    uniform mat4 projectionMatrix;
+    uniform mat4 viewMatrix;
+    uniform vec3 cameraPos;
+    
+    out vec4 FragColor;
+    
+    void main() {
+        // Calculate surface normal from derivatives
+        vec3 dFdxPos = dFdx(worldPos.xyz);
+        vec3 dFdyPos = dFdy(worldPos.xyz);
+        vec3 normal = normalize(cross(dFdxPos, dFdyPos));
+        
+        // Calculate view direction (from surface to camera)
+        vec3 viewDir = normalize(cameraPos - worldPos.xyz);
+        
+        // Check if surface is facing the camera (backface culling)
+        float facing = dot(normal, viewDir);
+        
+        // Project world position to screen space of source camera
+        vec4 projPos = projectionMatrix * viewMatrix * worldPos;
+        
+        // Perspective divide
+        vec3 ndcPos = projPos.xyz / projPos.w;
+        
+        // Convert to texture coordinates [0,1]
+        vec2 screenUV = ndcPos.xy * 0.5 + 0.5;
+        
+        // Check if within valid projection range and facing camera
+        if (facing < 0.0 ||
+            screenUV.x < 0.0 || screenUV.x > 1.0 || 
+            screenUV.y < 0.0 || screenUV.y > 1.0 ||
+            ndcPos.z < -1.0 || ndcPos.z > 1.0) {
+            // Backface or outside projection, use a default color
+            FragColor = vec4(0.5, 0.5, 0.5, 1.0);
+        } else {
+            // Sample the source texture using projected UV
+            FragColor = texture(sourceTexture, screenUV);
+        }
+    }
+)";
+
 
 void checkShaderErrors(GLuint shader, std::string type) {
     GLint success;
@@ -77,6 +156,9 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
         }
         if (key == GLFW_KEY_U) {
             g_triggerUnwrap = true;
+        }
+        if (key == GLFW_KEY_P) {
+            g_triggerProjection = true;
         }
         if (key == GLFW_KEY_ESCAPE) {
             glfwSetWindowShouldClose(window, true);
@@ -160,6 +242,26 @@ void initGL() {
     glDeleteShader(vertexShader);
     glDeleteShader(fragmentShader);
     
+    // Build projection shader
+    GLuint projVertShader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(projVertShader, 1, &projectionVertexShader, NULL);
+    glCompileShader(projVertShader);
+    checkShaderErrors(projVertShader, "PROJECTION_VERTEX");
+    
+    GLuint projFragShader = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(projFragShader, 1, &projectionFragmentShader, NULL);
+    glCompileShader(projFragShader);
+    checkShaderErrors(projFragShader, "PROJECTION_FRAGMENT");
+    
+    projectionShaderProgram = glCreateProgram();
+    glAttachShader(projectionShaderProgram, projVertShader);
+    glAttachShader(projectionShaderProgram, projFragShader);
+    glLinkProgram(projectionShaderProgram);
+    checkProgramErrors(projectionShaderProgram, "PROJECTION_PROGRAM");
+    
+    glDeleteShader(projVertShader);
+    glDeleteShader(projFragShader);
+    
     // Buffers
     glGenVertexArrays(1, &vao);
     glGenBuffers(1, &vbo);
@@ -191,7 +293,8 @@ void initGL() {
     glBindBuffer(GL_ARRAY_BUFFER, uvbo);
     glBufferData(GL_ARRAY_BUFFER, maxVerts * sizeof(float) * 2, NULL, GL_DYNAMIC_DRAW);
     glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(2);
+    // Don't enable yet - will enable after unwrapping
+    // glEnableVertexAttribArray(2);
     
     // IBO (Unused in Sparse Mode, but allocated to keep interop happy if strictly required, or just small)
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
@@ -319,6 +422,11 @@ void PerformUnwrap(const std::vector<float4>& rawVerts) {
     glBindBuffer(GL_ARRAY_BUFFER, uvbo);
     glBufferData(GL_ARRAY_BUFFER, unwrappedUVs.size() * sizeof(float2), unwrappedUVs.data(), GL_STATIC_DRAW);
     
+    // Enable UV attribute array now that we have valid data
+    glBindVertexArray(vao);
+    glEnableVertexAttribArray(2);
+    glBindVertexArray(0);
+    
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, unwrappedIndices.size() * sizeof(uint32_t), unwrappedIndices.data(), GL_STATIC_DRAW);
     
@@ -328,6 +436,89 @@ void PerformUnwrap(const std::vector<float4>& rawVerts) {
     
     std::cout << "Mesh unwrapped and updated in-place." << std::endl;
 }
+
+void PerformProjectionBaking(const float* model, const float* view, const float* projection, int textureSize = 2048) {
+    if (!g_isUnwrapped) {
+        std::cout << "Mesh must be unwrapped first before projection baking!" << std::endl;
+        return;
+    }
+    
+    std::cout << "Starting projection baking to " << textureSize << "x" << textureSize << " texture..." << std::endl;
+    
+    // Calculate camera position from view matrix
+    // View matrix is inverse of camera transform, so we need to extract camera position
+    // For a view matrix that translates by (0, 0, -3), camera is at (0, 0, 3)
+    float cameraPos[3] = {0.0f, 0.0f, 3.0f}; // This matches the view matrix in main
+    
+    // Create baked texture if not exists
+    if (g_bakedTextureID == 0) {
+        glGenTextures(1, &g_bakedTextureID);
+        glBindTexture(GL_TEXTURE_2D, g_bakedTextureID);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, textureSize, textureSize, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    
+    // Create FBO if not exists
+    if (g_fbo == 0) {
+        glGenFramebuffers(1, &g_fbo);
+        glGenRenderbuffers(1, &g_rbo);
+        
+        glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+        
+        // Attach texture
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_bakedTextureID, 0);
+        
+        // Setup depth renderbuffer
+        glBindRenderbuffer(GL_RENDERBUFFER, g_rbo);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, textureSize, textureSize);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_rbo);
+        
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            std::cerr << "Framebuffer is not complete!" << std::endl;
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            return;
+        }
+        
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+    
+    // Render to texture using UV coordinates
+    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    glViewport(0, 0, textureSize, textureSize);
+    glClearColor(0.5f, 0.5f, 0.5f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+    
+    glUseProgram(projectionShaderProgram);
+    
+    // Pass the current camera matrices for projection
+    glUniformMatrix4fv(glGetUniformLocation(projectionShaderProgram, "model"), 1, GL_FALSE, model);
+    glUniformMatrix4fv(glGetUniformLocation(projectionShaderProgram, "view"), 1, GL_FALSE, view);
+    glUniformMatrix4fv(glGetUniformLocation(projectionShaderProgram, "projection"), 1, GL_FALSE, projection);
+    glUniformMatrix4fv(glGetUniformLocation(projectionShaderProgram, "projectionMatrix"), 1, GL_FALSE, projection);
+    glUniformMatrix4fv(glGetUniformLocation(projectionShaderProgram, "viewMatrix"), 1, GL_FALSE, view);
+    glUniform3fv(glGetUniformLocation(projectionShaderProgram, "cameraPos"), 1, cameraPos);
+    
+    // Bind source texture
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_textureID);
+    glUniform1i(glGetUniformLocation(projectionShaderProgram, "sourceTexture"), 0);
+    
+    // Draw the mesh
+    glBindVertexArray(vao);
+    glDrawElements(GL_TRIANGLES, (GLsizei)g_indexCount, GL_UNSIGNED_INT, 0);
+    
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    
+    g_hasProjectedTexture = true;
+    std::cout << "Projection baking complete!" << std::endl;
+    
+    checkGLErrors("PerformProjectionBaking");
+}
+
 
 int main() {
     initGL();
@@ -528,6 +719,15 @@ int main() {
             }
         }
         // -------------------------
+        
+        // --- Projection Baking Trigger ---
+        if (g_triggerProjection) {
+            g_triggerProjection = false;
+            PerformProjectionBaking(model, view, projection);
+            // Restore viewport after baking
+            glViewport(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
+        }
+        // ---------------------------------
 
         // Update UBO from Mesh (it might have sorted them)
         const auto& currentGPUPrimitives = mesh.GetGPUPrimitives();
@@ -583,14 +783,24 @@ int main() {
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, view);
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, projection);
         
+        // Always bind texture1 sampler to avoid GL_INVALID_OPERATION
         glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, g_textureID);
+        if (g_hasProjectedTexture) {
+            glBindTexture(GL_TEXTURE_2D, g_bakedTextureID);
+        } else {
+            glBindTexture(GL_TEXTURE_2D, g_textureID); // Bind source texture (won't be used unless useTexture=1)
+        }
         glUniform1i(glGetUniformLocation(shaderProgram, "texture1"), 1);
 
         glBindVertexArray(vao);
         
         if (g_isUnwrapped) {
-            glUniform1i(glGetUniformLocation(shaderProgram, "useTexture"), 1);
+            // After unwrap, still use vertex colors unless projection baked
+            if (g_hasProjectedTexture) {
+                glUniform1i(glGetUniformLocation(shaderProgram, "useTexture"), 1);
+            } else {
+                glUniform1i(glGetUniformLocation(shaderProgram, "useTexture"), 0);
+            }
             glDrawElements(GL_TRIANGLES, (GLsizei)g_indexCount, GL_UNSIGNED_INT, 0);
         } else {
             glUniform1i(glGetUniformLocation(shaderProgram, "useTexture"), 0);
