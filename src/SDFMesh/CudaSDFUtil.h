@@ -71,6 +71,11 @@ inline SDFPrimitive CreateRoundedCylinderPrim(float3 position, float4 rotation, 
 inline const char* vertexShaderSource = R"(
     #version 330 core
     layout (location = 0) in vec4 aPos;
+    // We will bind UVs as a second attribute when rendering the unwrapped mesh.
+    // For standard Marching Cubes (soup), we don't have UVs.
+    // So we will use a uniform to toggle mode, or just a separate shader.
+    // Let's modify this shader to accept optional UV attribute.
+    layout (location = 2) in vec2 aTexCoord; 
     
     uniform mat4 model;
     uniform mat4 view;
@@ -78,12 +83,14 @@ inline const char* vertexShaderSource = R"(
     
     out vec3 FragPos;
     out vec3 FragPosWorld; 
+    out vec2 TexCoord;
 
     void main() {
         vec4 worldPos = model * vec4(aPos.xyz, 1.0); 
         gl_Position = projection * view * worldPos;
         FragPos = aPos.xyz; 
         FragPosWorld = aPos.xyz; 
+        TexCoord = aTexCoord;
     }
 )";
 
@@ -91,9 +98,12 @@ inline const char* fragmentShaderSource = R"(
     #version 330 core
     out vec4 FragColor;
     in vec3 FragPos;
+    in vec2 TexCoord;
     
     uniform float time;
     uniform samplerBuffer bvhNodes;
+    uniform sampler2D texture1;
+    uniform int useTexture; // 0 = SDF Color, 1 = Texture
     
     struct Primitive {
         vec4 info; // x=type, y=op, z=disp, w=blend
@@ -434,6 +444,11 @@ inline const char* fragmentShaderSource = R"(
         
         float diff = max(dot(normal, lightDir), 0.0);
         vec3 color = sdfColor * (diff + 0.2);
+        
+        if (useTexture == 1) {
+            vec3 texColor = texture(texture1, TexCoord).rgb;
+            color = texColor * (diff + 0.2);
+        }
         
         FragColor = vec4(color, 1.0);
     }

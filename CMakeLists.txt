@@ -12,6 +12,10 @@ FetchContent_Declare(
   GIT_REPOSITORY https://github.com/glfw/glfw
   GIT_TAG        3.3.8
 )
+set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(glfw)
 
 message(STATUS "Fetching GLAD...")
@@ -23,6 +27,24 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(glad)
 
+message(STATUS "Fetching Eigen...")
+set(EIGEN_BUILD_DOC OFF CACHE BOOL "" FORCE)
+set(EIGEN_BUILD_PKGCONFIG OFF CACHE BOOL "" FORCE)
+set(EIGEN_TESTING OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  Eigen
+  GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+  GIT_TAG        3.4.0
+  GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(Eigen)
+
+# Copy Assets
+file(COPY ${CMAKE_SOURCE_DIR}/assets/test_pattern.jpg DESTINATION ${CMAKE_BINARY_DIR}/Release)
+file(COPY ${CMAKE_SOURCE_DIR}/assets/test_pattern.jpg DESTINATION ${CMAKE_BINARY_DIR}/Debug)
+file(COPY ${CMAKE_SOURCE_DIR}/assets/test_pattern.jpg DESTINATION ${CMAKE_BINARY_DIR})
+
 find_package(OpenGL REQUIRED)
 
 include_directories(src)
@@ -32,6 +54,14 @@ set(SOURCES
     src/SDFMesh/CudaSDFMesh.cpp
     src/SDFMesh/MarchingCubesKernels.cu
     src/SDFMesh/Wrappers.cu
+    src/uv_unwrap/common/mesh.cpp
+    src/uv_unwrap/common/adjacency.cpp
+    src/uv_unwrap/unwrap/chart_builder.cpp
+    src/uv_unwrap/unwrap/boundary_loops.cpp
+    src/uv_unwrap/unwrap/flatten_harmonic.cpp
+    src/uv_unwrap/unwrap/atlas_packer.cpp
+    src/uv_unwrap/unwrap/seam_splitter.cpp
+    src/uv_unwrap/unwrap/unwrap_pipeline.cpp
 )
 
 add_executable(CudaSDF ${SOURCES})
@@ -48,6 +78,7 @@ endif()
 target_link_libraries(CudaSDF PRIVATE 
     glfw
     OpenGL::GL
+    Eigen3::Eigen
 )
 
 set_target_properties(CudaSDF PROPERTIES CUDA_ARCHITECTURES "80;86;89;90")

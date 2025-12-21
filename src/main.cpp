@@ -6,19 +6,28 @@
 #include <string>
 #include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
+#include <map>
+#include <fstream>
 
 #include "SDFMesh/Commons.cuh"
 #include "SDFMesh/CudaSDFMesh.h"
-#include "SDFMesh/CudaSDFUtil.h" // For shader sources and helpers
+#include "SDFMesh/CudaSDFUtil.h" 
+#include "uv_unwrap/unwrap/unwrap_pipeline.h"
+#include "uv_unwrap/unwrap/seam_splitter.h"
+#include "uv_unwrap/common/mesh.h"
+
+#include "SDFMesh/TextureLoader.h"
 
 // Global variables
-const float GRID_SIZE = 128.0f; // Increased resolution
+const float GRID_SIZE = 128.0f; 
 const float CELL_SIZE = 1.0f/GRID_SIZE;
 const unsigned int WINDOW_WIDTH = 1024;
 const unsigned int WINDOW_HEIGHT = 768;
 
 GLuint shaderProgram;
-GLuint vao, vbo, ibo, cbo;
+GLuint vao, vbo, ibo, cbo, uvbo; // Added uvbo for texture coordinates
+GLuint g_textureID = 0;
+
 struct cudaGraphicsResource* cudaVBO;
 struct cudaGraphicsResource* cudaIBO; // Unused but kept for structure compatibility if needed
 struct cudaGraphicsResource* cudaCBO;
@@ -27,6 +36,10 @@ GLuint uboPrimitives; // UBO Handle
 GLuint tboBVH, texBVH; // BVH Texture Buffer
 
 CudaSDFMesh mesh;
+bool g_triggerUnwrap = false;
+bool g_AnimateMesh = true; // Flag to control animation/update
+bool g_isUnwrapped = false; // Track if mesh has been unwrapped
+uint32_t g_indexCount = 0; // Number of indices for indexed drawing
 
 void checkGLErrors(const char* label) {
     GLenum err;
@@ -61,6 +74,9 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
             static bool wireframe = false;
             wireframe = !wireframe;
             glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);
+        }
+        if (key == GLFW_KEY_U) {
+            g_triggerUnwrap = true;
         }
         if (key == GLFW_KEY_ESCAPE) {
             glfwSetWindowShouldClose(window, true);
@@ -149,6 +165,10 @@ void initGL() {
     glGenBuffers(1, &vbo);
     glGenBuffers(1, &cbo);
     glGenBuffers(1, &ibo);
+    glGenBuffers(1, &uvbo); // Buffer for texture coordinates
+
+    // Load Texture
+    g_textureID = LoadTexture("test_pattern.jpg");
     
     glBindVertexArray(vao);
     
@@ -167,9 +187,15 @@ void initGL() {
     glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
     glEnableVertexAttribArray(1);
     
+    // UVBO (vec2 texture coordinates, location 2)
+    glBindBuffer(GL_ARRAY_BUFFER, uvbo);
+    glBufferData(GL_ARRAY_BUFFER, maxVerts * sizeof(float) * 2, NULL, GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(2);
+    
     // IBO (Unused in Sparse Mode, but allocated to keep interop happy if strictly required, or just small)
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
-    unsigned int maxIndices = 1024; 
+    unsigned int maxIndices = 20000000 * 3; // Enough for indexed mesh
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, maxIndices * sizeof(unsigned int), NULL, GL_DYNAMIC_DRAW);
     
     // Register with CUDA
@@ -183,7 +209,6 @@ void initGL() {
         std::cerr << "CUDA Error Register CBO: " << cudaGetErrorString(errCBO) << std::endl; 
         exit(-1); 
     }
-    // if (cudaGraphicsGLRegisterBuffer(&cudaIBO, ibo, cudaGraphicsRegisterFlagsWriteDiscard) != cudaSuccess) { std::cerr << "CUDA Error Register IBO" << std::endl; exit(-1); }
     
     glBindVertexArray(0);
     
@@ -213,6 +238,95 @@ void initGL() {
     }
     
     checkGLErrors("initGL");
+}
+
+// Helpers for unwrap
+struct VertexKey {
+    int x, y, z;
+    bool operator<(const VertexKey& o) const {
+        if (x != o.x) return x < o.x;
+        if (y != o.y) return y < o.y;
+        return z < o.z;
+    }
+};
+
+uv::Mesh WeldMesh(const std::vector<float4>& rawVerts) {
+    uv::Mesh mesh;
+    std::map<VertexKey, uint32_t> uniqueMap;
+    // Quantize factor for welding
+    float q = 10000.0f; 
+    
+    for(size_t i=0; i<rawVerts.size(); ++i) {
+        uv::vec3 v = {rawVerts[i].x, rawVerts[i].y, rawVerts[i].z};
+        VertexKey key = { (int)(v.x * q), (int)(v.y * q), (int)(v.z * q) };
+        
+        if (uniqueMap.find(key) == uniqueMap.end()) {
+            uniqueMap[key] = (uint32_t)mesh.V.size();
+            mesh.V.push_back(v);
+        }
+        uint32_t idx = uniqueMap[key];
+        
+        // Add to triangles
+        // We know input is triangle soup, so every 3 verts = 1 tri
+        if (i % 3 == 0) mesh.F.push_back({0,0,0});
+        
+        uint32_t& triIdx = (i % 3 == 0) ? mesh.F.back().x : ((i % 3 == 1) ? mesh.F.back().y : mesh.F.back().z);
+        triIdx = idx;
+    }
+    return mesh;
+}
+
+void PerformUnwrap(const std::vector<float4>& rawVerts) {
+    if (rawVerts.empty()) {
+        std::cout << "No vertices to unwrap!" << std::endl;
+        return;
+    }
+    
+    std::cout << "Welding " << rawVerts.size() << " vertices..." << std::endl;
+    uv::Mesh mesh = WeldMesh(rawVerts);
+    std::cout << "Weld result: " << mesh.V.size() << " vertices, " << mesh.F.size() << " triangles." << std::endl;
+    
+    uv::UnwrapConfig cfg;
+    cfg.atlasMaxSize = 8192; // Increased to reduce packing failure chance
+    cfg.paddingPx = 2;       // Reduced padding to save space
+    
+    uv::UnwrapPipeline pipeline;
+    uv::UnwrapResult res = pipeline.Run(mesh, cfg);
+    
+    // Split vertices to handle hard UV seams
+    uv::Mesh splitMesh;
+    uv::UnwrapResult splitRes;
+    uv::SplitVerticesByChart(mesh, res, splitMesh, splitRes);
+    
+    // Prepare CPU buffers
+    std::vector<float4> unwrappedVerts(splitMesh.V.size());
+    std::vector<float2> unwrappedUVs(splitMesh.V.size());
+    for(size_t i=0; i<splitMesh.V.size(); ++i) {
+        unwrappedVerts[i] = make_float4(splitMesh.V[i].x, splitMesh.V[i].y, splitMesh.V[i].z, 1.0f);
+        unwrappedUVs[i] = make_float2(splitRes.uvAtlas[i].x, splitRes.uvAtlas[i].y);
+    }
+    
+    // Flatten Indices (for IBO)
+    std::vector<uint32_t> unwrappedIndices(splitMesh.F.size() * 3);
+    if (!splitMesh.F.empty()) {
+        memcpy(unwrappedIndices.data(), splitMesh.F.data(), splitMesh.F.size() * sizeof(uv::uvec3));
+    }
+    
+    // Update main VAO buffers in-place
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, unwrappedVerts.size() * sizeof(float4), unwrappedVerts.data(), GL_STATIC_DRAW);
+    
+    glBindBuffer(GL_ARRAY_BUFFER, uvbo);
+    glBufferData(GL_ARRAY_BUFFER, unwrappedUVs.size() * sizeof(float2), unwrappedUVs.data(), GL_STATIC_DRAW);
+    
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, unwrappedIndices.size() * sizeof(uint32_t), unwrappedIndices.data(), GL_STATIC_DRAW);
+    
+    // Store count for indexed rendering
+    g_indexCount = (uint32_t)unwrappedIndices.size();
+    g_isUnwrapped = true;
+    
+    std::cout << "Mesh unwrapped and updated in-place." << std::endl;
 }
 
 int main() {
@@ -350,38 +464,71 @@ int main() {
         }
         
         // Animate Primitives
-        scenePrimitives[0].dispParams[1] = 5.0f * sin(time*0.1f);
-        float c_rot = cos(time), s_rot = sin(time);
-        scenePrimitives[1].rotation = make_float4(0.0f, s_rot, 0.0f, c_rot);
-        scenePrimitives[2].position.y = -0.5f + 0.2f * sin(time * 2.0f);
-        scenePrimitives[3].params[2] = 0.1f + 0.05f * sin(time * 3.0f);
+        if (g_AnimateMesh) {
+            scenePrimitives[0].dispParams[1] = 5.0f * sin(time*0.1f);
+            float c_rot = cos(time), s_rot = sin(time);
+            scenePrimitives[1].rotation = make_float4(0.0f, s_rot, 0.0f, c_rot);
+            scenePrimitives[2].position.y = -0.5f + 0.2f * sin(time * 2.0f);
+            scenePrimitives[3].params[2] = 0.1f + 0.05f * sin(time * 3.0f);
 
-        // Update Mesh
-        mesh.ClearPrimitives();
-        for(const auto& p : scenePrimitives) {
-            mesh.AddPrimitive(p);
+            // Update Mesh
+            mesh.ClearPrimitives();
+            for(const auto& p : scenePrimitives) {
+                mesh.AddPrimitive(p);
+            }
+            
+            // Map GL buffers
+            if (cudaGraphicsMapResources(1, &cudaVBO, 0) != cudaSuccess) break;
+            if (cudaGraphicsMapResources(1, &cudaCBO, 0) != cudaSuccess) break;
+            // if (cudaGraphicsMapResources(1, &cudaIBO, 0) != cudaSuccess) break;
+            
+            float4* d_vboPtr;
+            float4* d_cboPtr;
+            unsigned int* d_iboPtr = nullptr;
+            size_t size;
+            
+            cudaGraphicsResourceGetMappedPointer((void**)&d_vboPtr, &size, cudaVBO);
+            cudaGraphicsResourceGetMappedPointer((void**)&d_cboPtr, &size, cudaCBO);
+            // cudaGraphicsResourceGetMappedPointer((void**)&d_iboPtr, &size, cudaIBO);
+            
+            mesh.Update(time, d_vboPtr, d_cboPtr, d_iboPtr);
+
+            cudaGraphicsUnmapResources(1, &cudaVBO, 0);
+            cudaGraphicsUnmapResources(1, &cudaCBO, 0);
+            // cudaGraphicsUnmapResources(1, &cudaIBO, 0);
         }
-        
-        // Map GL buffers
-        if (cudaGraphicsMapResources(1, &cudaVBO, 0) != cudaSuccess) break;
-        if (cudaGraphicsMapResources(1, &cudaCBO, 0) != cudaSuccess) break;
-        // if (cudaGraphicsMapResources(1, &cudaIBO, 0) != cudaSuccess) break;
-        
-        float4* d_vboPtr;
-        float4* d_cboPtr;
-        unsigned int* d_iboPtr = nullptr;
-        size_t size;
-        
-        cudaGraphicsResourceGetMappedPointer((void**)&d_vboPtr, &size, cudaVBO);
-        cudaGraphicsResourceGetMappedPointer((void**)&d_cboPtr, &size, cudaCBO);
-        // cudaGraphicsResourceGetMappedPointer((void**)&d_iboPtr, &size, cudaIBO);
-        
-        mesh.Update(time, d_vboPtr, d_cboPtr, d_iboPtr);
 
-        cudaGraphicsUnmapResources(1, &cudaVBO, 0);
-        cudaGraphicsUnmapResources(1, &cudaCBO, 0);
-        // cudaGraphicsUnmapResources(1, &cudaIBO, 0);
-        
+        // --- UV Unwrap Trigger ---
+        if (g_triggerUnwrap) {
+            g_triggerUnwrap = false;
+            
+            // Map the *current* buffers to read the current mesh state for unwrap
+            // We assume the mesh was updated at least once before this.
+            if (cudaGraphicsMapResources(1, &cudaVBO, 0) != cudaSuccess) break;
+            
+            float4* d_vboPtr;
+            size_t size;
+            cudaGraphicsResourceGetMappedPointer((void**)&d_vboPtr, &size, cudaVBO);
+            
+            unsigned int count = mesh.GetTotalVertexCount();
+            if (count > 0) {
+                std::vector<float4> hostVerts(count);
+                cudaMemcpy(hostVerts.data(), d_vboPtr, count * sizeof(float4), cudaMemcpyDeviceToHost);
+                
+                // Unmap before doing heavy CPU work
+                cudaGraphicsUnmapResources(1, &cudaVBO, 0); 
+                
+                PerformUnwrap(hostVerts);
+                
+                // After unwrap, stop updating the mesh so we can see the result
+                g_AnimateMesh = false;
+            } else {
+                std::cout << "Mesh is empty, cannot unwrap." << std::endl;
+                cudaGraphicsUnmapResources(1, &cudaVBO, 0);
+            }
+        }
+        // -------------------------
+
         // Update UBO from Mesh (it might have sorted them)
         const auto& currentGPUPrimitives = mesh.GetGPUPrimitives();
         glBindBuffer(GL_UNIFORM_BUFFER, uboPrimitives);
@@ -436,9 +583,20 @@ int main() {
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, view);
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, projection);
         
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, g_textureID);
+        glUniform1i(glGetUniformLocation(shaderProgram, "texture1"), 1);
+
         glBindVertexArray(vao);
-        // Switch to DrawArrays for Triangle Soup
-        glDrawArrays(GL_TRIANGLES, 0, mesh.GetTotalVertexCount());
+        
+        if (g_isUnwrapped) {
+            glUniform1i(glGetUniformLocation(shaderProgram, "useTexture"), 1);
+            glDrawElements(GL_TRIANGLES, (GLsizei)g_indexCount, GL_UNSIGNED_INT, 0);
+        } else {
+            glUniform1i(glGetUniformLocation(shaderProgram, "useTexture"), 0);
+            // Switch to DrawArrays for Triangle Soup
+            glDrawArrays(GL_TRIANGLES, 0, mesh.GetTotalVertexCount());
+        }
         
         checkGLErrors("draw");
 
