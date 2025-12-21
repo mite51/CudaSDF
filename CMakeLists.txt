@@ -54,14 +54,15 @@ set(SOURCES
     src/SDFMesh/CudaSDFMesh.cpp
     src/SDFMesh/MarchingCubesKernels.cu
     src/SDFMesh/Wrappers.cu
-    src/uv_unwrap/common/mesh.cpp
-    src/uv_unwrap/common/adjacency.cpp
-    src/uv_unwrap/unwrap/chart_builder.cpp
-    src/uv_unwrap/unwrap/boundary_loops.cpp
-    src/uv_unwrap/unwrap/flatten_harmonic.cpp
-    src/uv_unwrap/unwrap/atlas_packer.cpp
-    src/uv_unwrap/unwrap/seam_splitter.cpp
-    src/uv_unwrap/unwrap/unwrap_pipeline.cpp
+    src/uv_unwrap_harmonic_parameterization/common/mesh.cpp
+    src/uv_unwrap_harmonic_parameterization/common/adjacency.cpp
+    src/uv_unwrap_harmonic_parameterization/unwrap/chart_builder.cpp
+    src/uv_unwrap_harmonic_parameterization/unwrap/boundary_loops.cpp
+    src/uv_unwrap_harmonic_parameterization/unwrap/flatten_lscm.cpp
+    src/uv_unwrap_harmonic_parameterization/unwrap/atlas_packer.cpp
+    src/uv_unwrap_harmonic_parameterization/unwrap/seam_splitter.cpp
+    src/uv_unwrap_harmonic_parameterization/unwrap/unwrap_pipeline.cpp
+    src/uv_unwrap_harmonic_parameterization/unwrap/uv_validation.cpp
 )
 
 add_executable(CudaSDF ${SOURCES})

@@ -12,9 +12,9 @@
 #include "SDFMesh/Commons.cuh"
 #include "SDFMesh/CudaSDFMesh.h"
 #include "SDFMesh/CudaSDFUtil.h" 
-#include "uv_unwrap/unwrap/unwrap_pipeline.h"
-#include "uv_unwrap/unwrap/seam_splitter.h"
-#include "uv_unwrap/common/mesh.h"
+#include "uv_unwrap_harmonic_parameterization/unwrap/unwrap_pipeline.h"
+#include "uv_unwrap_harmonic_parameterization/unwrap/seam_splitter.h"
+#include "uv_unwrap_harmonic_parameterization/common/mesh.h"
 
 #include "SDFMesh/TextureLoader.h"
 
