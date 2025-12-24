@@ -7,6 +7,91 @@
 __constant__ float isoThreshold = 0.0f;
 
 // --------------------------------------------------------------------------
+// Robust helpers for Marching Cubes vertex interpolation / degenerate checks
+// --------------------------------------------------------------------------
+
+__device__ inline float3 cross3(const float3& a, const float3& b) {
+    return make_float3(
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x
+    );
+}
+
+__device__ inline bool isFinite3(const float3& v) {
+    return !(isnan(v.x) || isnan(v.y) || isnan(v.z) || isinf(v.x) || isinf(v.y) || isinf(v.z));
+}
+
+__device__ inline float safeEdgeT(float val1, float val2) {
+    // Prevent NaNs/Infs when val2 == val1, and reduce exact-endpoint collapses.
+    const float denom = val2 - val1;
+    float t = 0.5f;
+    if (fabsf(denom) > 1e-12f) {
+        t = (isoThreshold - val1) / denom;
+    }
+    // Avoid exact endpoints: if we hit exactly 0/1 due to equalities, nudge inward.
+    t = clamp(t, 0.0f, 1.0f);
+    const float endEps = 1e-7f;
+    if (t <= 0.0f) t = endEps;
+    if (t >= 1.0f) t = 1.0f - endEps;
+    return t;
+}
+
+__device__ inline float3 lerp3(const float3& a, const float3& b, float t) {
+    return make_float3(
+        a.x * (1.0f - t) + b.x * t,
+        a.y * (1.0f - t) + b.y * t,
+        a.z * (1.0f - t) + b.z * t
+    );
+}
+
+__device__ inline float len2_3(const float3& v) {
+    return v.x * v.x + v.y * v.y + v.z * v.z;
+}
+
+__device__ inline float3 interpEdgePoint(const SDFGrid& grid, const int4& xyz, const float cubeVal[8], int edgeId) {
+    const int c1 = edgeConnections[edgeId][0];
+    const int c2 = edgeConnections[edgeId][1];
+
+    const float val1 = cubeVal[c1];
+    const float val2 = cubeVal[c2];
+    const float t = safeEdgeT(val1, val2);
+
+    const int4 pos1I = make_int4(
+        xyz.x + marchingCubeCorners[c1][0],
+        xyz.y + marchingCubeCorners[c1][1],
+        xyz.z + marchingCubeCorners[c1][2], 0);
+
+    const int4 pos2I = make_int4(
+        xyz.x + marchingCubeCorners[c2][0],
+        xyz.y + marchingCubeCorners[c2][1],
+        xyz.z + marchingCubeCorners[c2][2], 0);
+
+    const float3 p1 = getLocation(grid, pos1I);
+    const float3 p2 = getLocation(grid, pos2I);
+    return lerp3(p1, p2, t);
+}
+
+__device__ inline bool isDegenerateTri(const float3 p[3], float cellSize) {
+    // Reject NaNs/Infs
+    if (!isFinite3(p[0]) || !isFinite3(p[1]) || !isFinite3(p[2])) return true;
+
+    // Reject collapsed vertices (very short edges)
+    const float minEdge = fmaxf(cellSize * 1e-4f, 1e-7f);
+    const float minEdge2 = minEdge * minEdge;
+    const float3 e01 = p[1] - p[0];
+    const float3 e12 = p[2] - p[1];
+    const float3 e20 = p[0] - p[2];
+    if (len2_3(e01) < minEdge2 || len2_3(e12) < minEdge2 || len2_3(e20) < minEdge2) return true;
+
+    // Reject near-zero area
+    const float3 n = cross3(e01, p[2] - p[0]);
+    if (len2_3(n) < 1e-18f) return true;
+
+    return false;
+}
+
+// --------------------------------------------------------------------------
 // Math Helpers
 // --------------------------------------------------------------------------
 
@@ -395,7 +480,7 @@ __global__ void countActiveBlockTriangles(SDFGrid grid, float time) {
     // Optimization: We could share memory or use warp shuffle, but for now brute force 8 eval
     // Since we don't have a global SDF grid anymore.
     
-    // float cubeVal[8]; // Unused in counting
+    float cubeVal[8];
     int code = 0;
     
     #pragma unroll
@@ -408,15 +493,29 @@ __global__ void countActiveBlockTriangles(SDFGrid grid, float time) {
         float d; float3 c;
         map(p, grid, time, d, c);
         
-        // cubeVal[i] = d;
-        if (d >= isoThreshold) code |= (1 << i);
+        cubeVal[i] = d;
+        // Treat exact-equality as "inside" to reduce corner-collapses.
+        if (d > isoThreshold) code |= (1 << i);
     }
     
     int firstIn = firstMarchingCubesId[code];
     int num = firstMarchingCubesId[code + 1] - firstIn;
-    
-    // Output 3 vertices per triangle
-    grid.d_packetVertexCounts[activeBlockId * SDF_BLOCK_SIZE_CUBED + tid] = num; // num indices
+
+    // Count only NON-degenerate triangles so offsets match what we actually write later.
+    unsigned int validCount = 0;
+    for (int i = 0; i < num; i += 3) {
+        float3 pTri[3];
+        #pragma unroll
+        for (int j = 0; j < 3; ++j) {
+            const int eid = marchingCubesIds[firstIn + i + j];
+            pTri[j] = interpEdgePoint(grid, xyz, cubeVal, eid);
+        }
+        if (!isDegenerateTri(pTri, grid.cellSize)) {
+            validCount += 3;
+        }
+    }
+
+    grid.d_packetVertexCounts[activeBlockId * SDF_BLOCK_SIZE_CUBED + tid] = validCount;
 }
 
 __global__ void generateActiveBlockTriangles(SDFGrid grid, float time) {
@@ -445,70 +544,48 @@ __global__ void generateActiveBlockTriangles(SDFGrid grid, float time) {
         map(p, grid, time, d, c);
         
         cubeVal[i] = d;
-        if (d >= isoThreshold) code |= (1 << i);
+        // Treat exact-equality as "inside" to reduce corner-collapses.
+        if (d > isoThreshold) code |= (1 << i);
     }
     
     int firstIn = firstMarchingCubesId[code];
     int num = firstMarchingCubesId[code + 1] - firstIn;
     
     // Generate Triangles
+    unsigned int write = first;
     for (int i = 0; i < num; i += 3) {
-        // Triangle i/3
-        int vOutIdx = first + i;
-        
-        if (vOutIdx + 2 >= grid.maxVertices) break;
-        
+        float3 pTri[3];
+        #pragma unroll
         for (int j = 0; j < 3; ++j) {
-            int eid = marchingCubesIds[firstIn + i + j];
-            // int v1 = marchingCubesEdgeLocations[eid][0]; // corner index 1 (unused)
-            // corner index 2 is implicit from edge? 
-            // marchingCubesEdgeLocations stores [dx, dy, dz, edgeAxis]
-            // We need corners.
-            // Let's use standard MC edge table logic
-            // edge 'eid' connects corner A and B
-            
-            // Standard table lookup
-            int c1 = edgeConnections[eid][0];
-            int c2 = edgeConnections[eid][1];
-            
-            float val1 = cubeVal[c1];
-            float val2 = cubeVal[c2];
-            
-            float t = (isoThreshold - val1) / (val2 - val1);
-            t = clamp(t, 0.0f, 1.0f);
-            
-            int4 pos1I = make_int4(
-                xyz.x + marchingCubeCorners[c1][0],
-                xyz.y + marchingCubeCorners[c1][1],
-                xyz.z + marchingCubeCorners[c1][2], 0);
-                
-            int4 pos2I = make_int4(
-                xyz.x + marchingCubeCorners[c2][0],
-                xyz.y + marchingCubeCorners[c2][1],
-                xyz.z + marchingCubeCorners[c2][2], 0);
-            
-            float3 p1 = getLocation(grid, pos1I);
-            float3 p2 = getLocation(grid, pos2I);
-            
-            float3 p = mix(p1, p2, t);
-            
-            // Compute Color/Normal
+            const int eid = marchingCubesIds[firstIn + i + j];
+            pTri[j] = interpEdgePoint(grid, xyz, cubeVal, eid);
+        }
+
+        if (isDegenerateTri(pTri, grid.cellSize)) {
+            continue; // counts/offsets already excluded these in countActiveBlockTriangles
+        }
+
+        if (write + 2 >= grid.maxVertices) break;
+
+        #pragma unroll
+        for (int j = 0; j < 3; ++j) {
+            const float3 p = pTri[j];
+
             float dist; float3 color;
             map(p, grid, time, dist, color);
-            
-            // Write Output
-            grid.d_vertices[vOutIdx + j] = make_float4(p.x, p.y, p.z, 1.0f);
+
+            grid.d_vertices[write + j] = make_float4(p.x, p.y, p.z, 1.0f);
             if (grid.d_vertexColors) {
-                grid.d_vertexColors[vOutIdx + j] = make_float4(color.x, color.y, color.z, 1.0f);
+                grid.d_vertexColors[write + j] = make_float4(color.x, color.y, color.z, 1.0f);
             }
         }
-        
-        // No indices needed for triangle soup (glDrawArrays)
-        // Or trivial indices:
+
         if (grid.d_indices) {
-            grid.d_indices[vOutIdx] = vOutIdx;
-            grid.d_indices[vOutIdx+1] = vOutIdx+1;
-            grid.d_indices[vOutIdx+2] = vOutIdx+2;
+            grid.d_indices[write] = write;
+            grid.d_indices[write + 1] = write + 1;
+            grid.d_indices[write + 2] = write + 2;
         }
+
+        write += 3;
     }
 }
