@@ -85,7 +85,8 @@ __device__ inline bool isDegenerateTri(const float3 p[3], float cellSize) {
     if (!isFinite3(p[0]) || !isFinite3(p[1]) || !isFinite3(p[2])) return true;
 
     // Reject collapsed vertices (very short edges)
-    const float minEdge = fmaxf(cellSize * 1e-4f, 1e-7f);
+    //const float minEdge = fmaxf(cellSize * 1e-4f, 1e-7f);
+    const float minEdge = cellSize / 1024.0f;
     const float minEdge2 = minEdge * minEdge;
     const float3 e01 = p[1] - p[0];
     const float3 e12 = p[2] - p[1];
@@ -93,9 +94,11 @@ __device__ inline bool isDegenerateTri(const float3 p[3], float cellSize) {
     if (len2_3(e01) < minEdge2 || len2_3(e12) < minEdge2 || len2_3(e20) < minEdge2) return true;
 
     // Reject near-zero area
+    /*
+    // JW - removing these cause manifold edges :/
     const float3 n = cross3(e01, p[2] - p[0]);
     if (len2_3(n) < 1e-18f) return true;
-
+    */
     return false;
 }
 
