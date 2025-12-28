@@ -56,6 +56,15 @@ enum DisplacementType {
     DISP_REVOLUTION
 };
 
+// UV Mapping Modes
+enum UVMode {
+    UV_PRIMITIVE = 0,       // Use primitive's canonical mapping
+    UV_WORLD_TRIPLANAR,     // World-space triplanar projection
+    UV_PLANAR_X,            // Planar projection along X axis
+    UV_PLANAR_Y,            // Planar projection along Y axis
+    UV_PLANAR_Z             // Planar projection along Z axis
+};
+
 // Optimized Struct Layout for Alignment (128 bytes stride)
 struct SDFPrimitive {
     // 16-byte aligned members first
@@ -81,7 +90,15 @@ struct SDFPrimitive {
     int displacement;     // 4 bytes
     int _pad1;            // 4 bytes (align to 8)
     
-    float _pad2[2];       // 8 bytes (align to 16 for array stride)
+    // UV Parameters (add 32 bytes)
+    float2 uvScale;       // 8 bytes
+    float2 uvOffset;      // 8 bytes
+    float uvRotation;     // 4 bytes
+    int uvMode;           // 4 bytes (UVMode enum)
+    int textureID;        // 4 bytes
+    int atlasIslandID;    // 4 bytes (assigned during atlas packing, -1 if not used)
+    
+    float _pad2[2];       // 8 bytes (to maintain 16-byte alignment)
 };
 
 struct BVHNode {
@@ -132,6 +149,10 @@ struct SDFGrid {
     float4* d_vertices; // Output vertices
     float4* d_vertexColors; // Output vertex colors
     unsigned int* d_indices; // Output indices (optional/trivial)
+    
+    // UV Output (NEW)
+    float2* d_uvCoords;     // Output UV coordinates (parallel to d_vertices)
+    int* d_primitiveIDs;    // Which primitive each vertex came from
     
     unsigned int maxVertices;
     unsigned int maxIndices;

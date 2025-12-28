@@ -25,7 +25,14 @@ inline SDFPrimitive CreatePrimitive(int type, float3 position, float4 rotation, 
     prim.operation = operation;
     prim.displacement = DISP_NONE;
     prim._pad1 = 0;
-    prim._pad2[0] = 0.0f; prim._pad2[1] = 0.0f;
+    
+    // Initialize UV parameters (NEW)
+    prim.uvScale = make_float2(1.0f, 1.0f);
+    prim.uvOffset = make_float2(0.0f, 0.0f);
+    prim.uvRotation = 0.0f;
+    prim.uvMode = UV_PRIMITIVE;
+    prim.textureID = 0;
+    prim.atlasIslandID = -1;
     
     return prim;
 }
@@ -71,26 +78,28 @@ inline SDFPrimitive CreateRoundedCylinderPrim(float3 position, float4 rotation, 
 inline const char* vertexShaderSource = R"(
     #version 330 core
     layout (location = 0) in vec4 aPos;
-    // We will bind UVs as a second attribute when rendering the unwrapped mesh.
-    // For standard Marching Cubes (soup), we don't have UVs.
-    // So we will use a uniform to toggle mode, or just a separate shader.
-    // Let's modify this shader to accept optional UV attribute.
-    layout (location = 2) in vec2 aTexCoord; 
+    // location 1 removed - not using vertex colors with texture array
+    layout (location = 2) in vec2 aTexCoord;
+    layout (location = 3) in float aPrimitiveID;  // Back to float for compatibility
     
     uniform mat4 model;
     uniform mat4 view;
     uniform mat4 projection;
     
     out vec3 FragPos;
-    out vec3 FragPosWorld; 
+    out vec3 FragPosWorld;
     out vec2 TexCoord;
+    out vec4 VertColor;
+    flat out int PrimitiveID;  // NEW: flat = no interpolation
 
     void main() {
-        vec4 worldPos = model * vec4(aPos.xyz, 1.0); 
+        vec4 worldPos = model * vec4(aPos.xyz, 1.0);
         gl_Position = projection * view * worldPos;
-        FragPos = aPos.xyz; 
-        FragPosWorld = aPos.xyz; 
+        FragPos = aPos.xyz;
+        FragPosWorld = worldPos.xyz;
         TexCoord = aTexCoord;
+        VertColor = vec4(1.0);  // Default white since we're not using vertex colors
+        PrimitiveID = int(aPrimitiveID);  // Convert float to int
     }
 )";
 
@@ -98,12 +107,17 @@ inline const char* fragmentShaderSource = R"(
     #version 330 core
     out vec4 FragColor;
     in vec3 FragPos;
+    in vec3 FragPosWorld;
     in vec2 TexCoord;
+    in vec4 VertColor;
+    flat in int PrimitiveID;  // NEW: Primitive ID (flat = no interpolation)
     
     uniform float time;
     uniform samplerBuffer bvhNodes;
-    uniform sampler2D texture1;
-    uniform int useTexture; // 0 = SDF Color, 1 = Texture
+    uniform sampler2D texture1;  // Legacy single texture support
+    uniform sampler2D atlasTexture;  // For atlas mode (single packed texture)
+    uniform sampler2DArray textureArray;  // NEW: 2D texture array for multiple textures
+    uniform int useTexture;  // 0 = SDF Color, 1 = Texture Array, 2 = Single Texture (legacy/atlas)
     
     struct Primitive {
         vec4 info; // x=type, y=op, z=disp, w=blend
@@ -427,10 +441,6 @@ inline const char* fragmentShaderSource = R"(
         vec3 sdfColor;
         map(FragPos, d, sdfColor);
         
-        // Check if we are rendering the cut surface
-        // We know the cut is roughly at x=0.2
-        // And we know it should be Blue.
-        
         vec3 lightDir = normalize(vec3(1.0, 1.0, 1.0));
         
         // Recalculate normal
@@ -443,11 +453,19 @@ inline const char* fragmentShaderSource = R"(
         vec3 normal = normalize(vec3(d_x - d_center, d_y - d_center, d_z - d_center));
         
         float diff = max(dot(normal, lightDir), 0.0);
-        vec3 color = sdfColor * (diff + 0.2);
+        vec3 color;
         
         if (useTexture == 1) {
-            vec3 texColor = texture(texture1, TexCoord).rgb;
+            // DIRECT MODE: Sample texture array using primitive ID as layer
+            vec3 texColor = texture(textureArray, vec3(TexCoord.xy, float(PrimitiveID))).rgb;
             color = texColor * (diff + 0.2);
+        } else if (useTexture == 2) {
+            // SINGLE TEXTURE / ATLAS MODE: Use atlasTexture sampler
+            vec3 texColor = texture(atlasTexture, TexCoord).rgb;
+            color = texColor * (diff + 0.2);
+        } else {
+            // SDF COLOR MODE: Use vertex colors or SDF evaluated color
+            color = sdfColor * (diff + 0.2);
         }
         
         FragColor = vec4(color, 1.0);

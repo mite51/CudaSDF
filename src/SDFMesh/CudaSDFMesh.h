@@ -19,7 +19,9 @@ public:
     
     // Update internal structures (BVH) and generate mesh on GPU
     // d_outVertices, d_outColors, d_outIndices must be valid device pointers
-    void Update(float time, float4* d_outVertices, float4* d_outColors, unsigned int* d_outIndices);
+    // d_outUVs and d_outPrimitiveIDs are optional (can be nullptr)
+    void Update(float time, float4* d_outVertices, float4* d_outColors, unsigned int* d_outIndices,
+                float2* d_outUVs = nullptr, int* d_outPrimitiveIDs = nullptr);
 
     // Getters for Renderer to update its buffers
     const std::vector<BVHNode>& GetBVHNodes() const { return m_bvhNodes; }

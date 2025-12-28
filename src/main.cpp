@@ -27,14 +27,18 @@ const unsigned int WINDOW_HEIGHT = 768;
 GLuint shaderProgram;
 GLuint projectionShaderProgram; // Shader for projection baking
 GLuint vao, vbo, ibo, cbo, uvbo; // Added uvbo for texture coordinates
+GLuint primidbo; // NEW: Primitive ID buffer
 GLuint g_textureID = 0; // Source texture for projection
 GLuint g_bakedTextureID = 0; // Baked texture from projection
+GLuint g_textureArray = 0; // NEW: Texture array for multi-texture support
 GLuint g_fbo = 0; // Framebuffer for projection baking
 GLuint g_rbo = 0; // Renderbuffer for depth
 
 struct cudaGraphicsResource* cudaVBO;
 struct cudaGraphicsResource* cudaIBO; // Unused but kept for structure compatibility if needed
 struct cudaGraphicsResource* cudaCBO;
+struct cudaGraphicsResource* cudaUVBO; // NEW: For UV coordinates
+struct cudaGraphicsResource* cudaPrimIDBO; // NEW: For primitive IDs
 
 GLuint uboPrimitives; // UBO Handle
 GLuint tboBVH, texBVH; // BVH Texture Buffer
@@ -45,6 +49,9 @@ bool g_triggerProjection = false; // Flag to trigger projection baking
 bool g_AnimateMesh = true; // Flag to control animation/update
 bool g_isUnwrapped = false; // Track if mesh has been unwrapped
 bool g_hasProjectedTexture = false; // Track if texture has been projection baked
+bool g_enableUVGeneration = false; // DISABLE to test basic rendering
+bool g_useTextureArray = false; // DISABLE to test basic rendering
+bool g_textureArrayValid = false; // NEW: Track if texture array loaded successfully
 uint32_t g_indexCount = 0; // Number of indices for indexed drawing
 
 void checkGLErrors(const char* label) {
@@ -52,6 +59,112 @@ void checkGLErrors(const char* label) {
     while ((err = glGetError()) != GL_NO_ERROR) {
         std::cerr << "OpenGL Error at " << label << ": " << err << std::endl;
     }
+}
+
+// Load texture array with multiple textures (all must be same size)
+GLuint LoadTextureArray(const std::vector<std::string>& filenames) {
+    if (filenames.empty()) {
+        std::cerr << "ERROR: No texture files provided!" << std::endl;
+        return 0;
+    }
+    
+    // Load first texture to determine size and format
+    int refWidth, refHeight, refChannels;
+    unsigned char* firstData = stbi_load(filenames[0].c_str(), &refWidth, &refHeight, &refChannels, 0);
+    if (!firstData) {
+        std::cerr << "ERROR: Failed to load first texture: " << filenames[0] << std::endl;
+        return 0;
+    }
+    
+    std::cout << "Reference texture: " << filenames[0] << " (" << refWidth << "x" << refHeight 
+              << ", " << refChannels << " channels)" << std::endl;
+    
+    GLenum internalFormat = (refChannels == 4) ? GL_RGBA8 : GL_RGB8;
+    GLenum format = (refChannels == 4) ? GL_RGBA : GL_RGB;
+    
+    GLuint textureArray;
+    glGenTextures(1, &textureArray);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, textureArray);
+    
+    int numLayers = (int)filenames.size();
+    
+    // Allocate storage for all layers
+    glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, internalFormat, refWidth, refHeight, numLayers,
+                 0, format, GL_UNSIGNED_BYTE, nullptr);
+    
+    // Set texture parameters
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    
+    // Upload first texture
+    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, 
+                  refWidth, refHeight, 1, 
+                  format, GL_UNSIGNED_BYTE, firstData);
+    stbi_image_free(firstData);
+    std::cout << "Loaded layer 0: " << filenames[0] << std::endl;
+    
+    // Load and verify remaining textures
+    bool allMatch = true;
+    for (int layer = 1; layer < numLayers; ++layer) {
+        int width, height, channels;
+        unsigned char* data = stbi_load(filenames[layer].c_str(), &width, &height, &channels, 0);
+        
+        if (!data) {
+            std::cerr << "ERROR: Failed to load texture: " << filenames[layer] << std::endl;
+            allMatch = false;
+            break;
+        }
+        
+        // Check if size matches reference
+        if (width != refWidth || height != refHeight) {
+            std::cerr << "ERROR: Texture size mismatch!" << std::endl;
+            std::cerr << "  Expected: " << refWidth << "x" << refHeight << std::endl;
+            std::cerr << "  Got:      " << width << "x" << height << " (" << filenames[layer] << ")" << std::endl;
+            std::cerr << "  All textures in a texture array must be the same size!" << std::endl;
+            stbi_image_free(data);
+            allMatch = false;
+            break;
+        }
+        
+        // Check if channel count matches (important for format compatibility)
+        if (channels != refChannels) {
+            std::cerr << "WARNING: Texture channel mismatch!" << std::endl;
+            std::cerr << "  Expected: " << refChannels << " channels" << std::endl;
+            std::cerr << "  Got:      " << channels << " channels (" << filenames[layer] << ")" << std::endl;
+            std::cerr << "  Attempting to convert..." << std::endl;
+            
+            // Reload with forced channel count
+            stbi_image_free(data);
+            data = stbi_load(filenames[layer].c_str(), &width, &height, &channels, refChannels);
+            if (!data) {
+                std::cerr << "ERROR: Failed to convert texture channels!" << std::endl;
+                allMatch = false;
+                break;
+            }
+        }
+        
+        // Upload to layer
+        glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, layer, 
+                      width, height, 1, 
+                      format, GL_UNSIGNED_BYTE, data);
+        stbi_image_free(data);
+        std::cout << "Loaded layer " << layer << ": " << filenames[layer] << std::endl;
+    }
+    
+    if (!allMatch) {
+        std::cerr << "ERROR: Texture array creation failed due to size mismatch!" << std::endl;
+        glDeleteTextures(1, &textureArray);
+        return 0;
+    }
+    
+    // Generate mipmaps
+    glGenerateMipmap(GL_TEXTURE_2D_ARRAY);
+    std::cout << "Successfully created texture array with " << numLayers << " layers (" 
+              << refWidth << "x" << refHeight << ")" << std::endl;
+    
+    return textureArray;
 }
 
 // Simple projection shader sources
@@ -160,6 +273,22 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
         if (key == GLFW_KEY_P) {
             g_triggerProjection = true;
         }
+        if (key == GLFW_KEY_T) {  // NEW: Toggle texture array mode
+            g_useTextureArray = !g_useTextureArray;
+            if (g_useTextureArray && !g_textureArrayValid) {
+                std::cout << "Texture array mode: ON (but no textures loaded - will show SDF colors)" << std::endl;
+            } else {
+                std::cout << "Texture array mode: " << (g_useTextureArray ? "ON" : "OFF") << std::endl;
+            }
+        }
+        if (key == GLFW_KEY_V) {  // NEW: Toggle UV generation
+            g_enableUVGeneration = !g_enableUVGeneration;
+            std::cout << "UV generation: " << (g_enableUVGeneration ? "ON" : "OFF") << std::endl;
+        }
+        if (key == GLFW_KEY_SPACE) {  // NEW: Toggle animation
+            g_AnimateMesh = !g_AnimateMesh;
+            std::cout << "Animation: " << (g_AnimateMesh ? "ON" : "OFF") << std::endl;
+        }
         if (key == GLFW_KEY_ESCAPE) {
             glfwSetWindowShouldClose(window, true);
         }
@@ -239,6 +368,16 @@ void initGL() {
     glLinkProgram(shaderProgram);
     checkProgramErrors(shaderProgram, "PROGRAM");
     
+    // Verify the program is valid
+    GLint isLinked = 0;
+    glGetProgramiv(shaderProgram, GL_LINK_STATUS, &isLinked);
+    if (isLinked == GL_FALSE) {
+        std::cerr << "ERROR: Shader program failed to link!" << std::endl;
+        exit(-1);
+    }
+    
+    std::cout << "Shader program linked successfully" << std::endl;
+    
     glDeleteShader(vertexShader);
     glDeleteShader(fragmentShader);
     
@@ -287,14 +426,21 @@ void initGL() {
     glBufferData(GL_ARRAY_BUFFER, maxVerts * sizeof(float) * 4, NULL, GL_DYNAMIC_DRAW);
     
     glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(1);
+    // DON'T enable - shader doesn't use aColor
+    // glEnableVertexAttribArray(1);
     
     // UVBO (vec2 texture coordinates, location 2)
     glBindBuffer(GL_ARRAY_BUFFER, uvbo);
     glBufferData(GL_ARRAY_BUFFER, maxVerts * sizeof(float) * 2, NULL, GL_DYNAMIC_DRAW);
     glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
-    // Don't enable yet - will enable after unwrapping
-    // glEnableVertexAttribArray(2);
+    glEnableVertexAttribArray(2);  // Enable for UV generation
+    
+    // NEW: Primitive ID Buffer (float to avoid compatibility issues)
+    glGenBuffers(1, &primidbo);
+    glBindBuffer(GL_ARRAY_BUFFER, primidbo);
+    glBufferData(GL_ARRAY_BUFFER, maxVerts * sizeof(float), NULL, GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(float), (void*)0);
+    glEnableVertexAttribArray(3);  // Enable for primitive ID
     
     // IBO (Unused in Sparse Mode, but allocated to keep interop happy if strictly required, or just small)
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
@@ -313,7 +459,39 @@ void initGL() {
         exit(-1); 
     }
     
+    // NEW: Register UV and Primitive ID buffers with CUDA
+    cudaError_t errUVBO = cudaGraphicsGLRegisterBuffer(&cudaUVBO, uvbo, cudaGraphicsRegisterFlagsWriteDiscard);
+    if (errUVBO != cudaSuccess) {
+        std::cerr << "CUDA Error Register UVBO: " << cudaGetErrorString(errUVBO) << std::endl;
+        exit(-1);
+    }
+    
+    cudaError_t errPrimIDBO = cudaGraphicsGLRegisterBuffer(&cudaPrimIDBO, primidbo, cudaGraphicsRegisterFlagsWriteDiscard);
+    if (errPrimIDBO != cudaSuccess) {
+        std::cerr << "CUDA Error Register PrimIDBO: " << cudaGetErrorString(errPrimIDBO) << std::endl;
+        exit(-1);
+    }
+    
     glBindVertexArray(0);
+    
+    // NEW: Load Texture Array
+    std::vector<std::string> textureFiles = {
+        "assets/T_checkerNumbered.PNG",          // Layer 0
+        "assets/T_debug_color_01.PNG",           // Layer 1
+        "assets/T_debug_uv_01.PNG",              // Layer 2
+        "assets/T_debug_orientation_01.PNG",     // Layer 3
+        "assets/T_OmniDebugTexture_COL.png"      // Layer 4
+    };
+    g_textureArray = LoadTextureArray(textureFiles);  // Auto-detect size
+    g_textureArrayValid = (g_textureArray != 0);
+    
+    if (g_textureArrayValid) {
+        g_useTextureArray = true;  // Enable texture array mode
+        std::cout << "Texture array mode ENABLED" << std::endl;
+    } else {
+        std::cout << "Texture array mode DISABLED (textures not found)" << std::endl;
+        std::cout << "Press 'T' to toggle texture array mode when textures are available" << std::endl;
+    }
     
     // Create UBO
     glGenBuffers(1, &uboPrimitives);
@@ -523,13 +701,15 @@ void PerformProjectionBaking(const float* model, const float* view, const float*
 int main() {
     initGL();
     mesh.Initialize(CELL_SIZE, make_float3(-1.1f, -1.1f, -1.1f), make_float3(1.1f, 1.1f, 1.1f));
+    // UV generation is controlled by passing non-null pointers to Update()
+    g_enableUVGeneration = true;  // Enable flag
     
     GLFWwindow* window = glfwGetCurrentContext();
 
     // Create Scene (Primitives Showcase)
     std::vector<SDFPrimitive> scenePrimitives;
     
-    // 1. Torus (green)
+    // 1. Torus (green) - Checker pattern
     SDFPrimitive torus = CreateTorusPrim(
         make_float3(-0.5f, 0.5f, 0.0f),
         make_float4(0.0f, 0.0f, 0.0f, 1.0f),
@@ -539,9 +719,11 @@ int main() {
         0.4f,
         0.15f
     );
+    torus.uvScale = make_float2(4.0f, 2.0f);  // Tile 4x horizontally, 2x vertically
+    torus.textureID = 0;  // Checker numbered texture
     scenePrimitives.push_back(torus);
 
-    // 2. Hex Prism (Red)(Twisted)
+    // 2. Hex Prism (Red)(Twisted) - Color debug texture
     SDFPrimitive hex = CreateHexPrismPrim(
         make_float3(0.5f, 0.5f, 0.0f),
         make_float4(0.0f, 0.0f, 0.0f, 1.0f),
@@ -553,9 +735,11 @@ int main() {
     );
     hex.displacement = DISP_TWIST;
     hex.dispParams[0] = 2.0f; // Initial Twist
+    hex.uvScale = make_float2(2.0f, 1.0f);  // 2x horizontal wrap
+    hex.textureID = 1;  // Color debug 01
     scenePrimitives.push_back(hex);
 
-    // 3. Rounded Cone (Blue)
+    // 3. Rounded Cone (Blue) - UV debug texture
     SDFPrimitive cone = CreateRoundedConePrim(
         make_float3(-0.5f, -0.5f, 0.0f),
         make_float4(0.0f, 0.0f, 0.0f, 1.0f),
@@ -566,9 +750,11 @@ int main() {
         0.3f,
         0.1f
     );
+    cone.uvScale = make_float2(1.0f, 1.0f);  // Standard mapping
+    cone.textureID = 2;  // UV debug 01
     scenePrimitives.push_back(cone);
 
-    // 4. Rounded Cylinder (Yellow)
+    // 4. Rounded Cylinder (Yellow) - Orientation debug
     SDFPrimitive cyl = CreateRoundedCylinderPrim(
         make_float3(0.5f, -0.5f, 0.0f),
         make_float4(0.0f, 0.0f, 0.0f, 1.0f),
@@ -579,9 +765,11 @@ int main() {
         0.2f,
         0.1f
     );
+    cyl.uvScale = make_float2(3.0f, 1.5f);  // 3x wrap, 1.5x vertical
+    cyl.textureID = 3;  // Orientation debug
     scenePrimitives.push_back(cyl);
 
-    // 5. Sphere (Purple, Subtracted)
+    // 5. Sphere (Purple, Subtracted) - Omni debug texture
     SDFPrimitive sphere = CreateSpherePrim(
         make_float3(0.0f, 0.0f, 0.0f),
         make_float4(0.0f, 0.0f, 0.0f, 1.0f),
@@ -590,6 +778,8 @@ int main() {
         0.0f,
         0.6f
     );
+    sphere.uvScale = make_float2(2.0f, 2.0f);  // 2x tiling
+    sphere.textureID = 4;  // Omni debug texture
     scenePrimitives.push_back(sphere);
 
     // Upload UBO once (initial)
@@ -646,14 +836,6 @@ int main() {
 
         float time = (float)currentTime;
         
-        // Print stats every 1 second
-        static float lastPrintTime = 0.0f;
-        if (time - lastPrintTime > 1.0f) {
-            CudaSDFMesh::MemStats stats = mesh.GetMemoryStats();
-            std::cout << "GPU Mem: Used " << (stats.usedGPU / 1024 / 1024) << " MB, Free " << (stats.freeGPU / 1024 / 1024) << " MB | Blocks: " << stats.activeBlocks << "/" << stats.allocatedBlocks << std::endl;
-            lastPrintTime = time;
-        }
-        
         // Animate Primitives
         if (g_AnimateMesh) {
             scenePrimitives[0].dispParams[1] = 5.0f * sin(time*0.1f);
@@ -671,21 +853,54 @@ int main() {
             // Map GL buffers
             if (cudaGraphicsMapResources(1, &cudaVBO, 0) != cudaSuccess) break;
             if (cudaGraphicsMapResources(1, &cudaCBO, 0) != cudaSuccess) break;
-            // if (cudaGraphicsMapResources(1, &cudaIBO, 0) != cudaSuccess) break;
+            // NEW: Map UV and Primitive ID buffers if UV generation is enabled
+            if (g_enableUVGeneration) {
+                cudaError_t uvErr = cudaGraphicsMapResources(1, &cudaUVBO, 0);
+                cudaError_t primErr = cudaGraphicsMapResources(1, &cudaPrimIDBO, 0);
+                
+                if (uvErr != cudaSuccess) {
+                    std::cerr << "ERROR mapping UVBO: " << cudaGetErrorString(uvErr) << std::endl;
+                    break;
+                }
+                if (primErr != cudaSuccess) {
+                    std::cerr << "ERROR mapping PrimIDBO: " << cudaGetErrorString(primErr) << std::endl;
+                    break;
+                }
+            }
             
             float4* d_vboPtr;
             float4* d_cboPtr;
             unsigned int* d_iboPtr = nullptr;
+            float2* d_uvPtr = nullptr;
+            int* d_primIDPtr = nullptr;
             size_t size;
             
             cudaGraphicsResourceGetMappedPointer((void**)&d_vboPtr, &size, cudaVBO);
             cudaGraphicsResourceGetMappedPointer((void**)&d_cboPtr, &size, cudaCBO);
-            // cudaGraphicsResourceGetMappedPointer((void**)&d_iboPtr, &size, cudaIBO);
             
-            mesh.Update(time, d_vboPtr, d_cboPtr, d_iboPtr);
-
+            // NEW: Get UV and Primitive ID pointers
+            if (g_enableUVGeneration) {
+                cudaError_t uvPtrErr = cudaGraphicsResourceGetMappedPointer((void**)&d_uvPtr, &size, cudaUVBO);
+                cudaError_t primPtrErr = cudaGraphicsResourceGetMappedPointer((void**)&d_primIDPtr, &size, cudaPrimIDBO);
+                
+                if (uvPtrErr != cudaSuccess) {
+                    std::cerr << "ERROR getting UV pointer: " << cudaGetErrorString(uvPtrErr) << std::endl;
+                }
+                if (primPtrErr != cudaSuccess) {
+                    std::cerr << "ERROR getting PrimID pointer: " << cudaGetErrorString(primPtrErr) << std::endl;
+                }
+            }
+            
+            // Update mesh with UV generation
+            mesh.Update(time, d_vboPtr, d_cboPtr, d_iboPtr, d_uvPtr, d_primIDPtr);
+            
             cudaGraphicsUnmapResources(1, &cudaVBO, 0);
             cudaGraphicsUnmapResources(1, &cudaCBO, 0);
+            // NEW: Unmap UV and Primitive ID buffers
+            if (g_enableUVGeneration) {
+                cudaGraphicsUnmapResources(1, &cudaUVBO, 0);
+                cudaGraphicsUnmapResources(1, &cudaPrimIDBO, 0);
+            }
             // cudaGraphicsUnmapResources(1, &cudaIBO, 0);
         }
 
@@ -765,6 +980,18 @@ int main() {
         
         glUseProgram(shaderProgram);
         
+        // Validate the program with current GL state
+        glValidateProgram(shaderProgram);
+        GLint isValid = 0;
+        glGetProgramiv(shaderProgram, GL_VALIDATE_STATUS, &isValid);
+        if (isValid == GL_FALSE) {
+            GLchar infoLog[1024];
+            glGetProgramInfoLog(shaderProgram, 1024, NULL, infoLog);
+            std::cerr << "ERROR: Shader program validation failed: " << infoLog << std::endl;
+            std::cerr << "Press any key to continue..." << std::endl;
+            std::cin.get();
+        }
+        
         // Set time
         glUniform1f(glGetUniformLocation(shaderProgram, "time"), time);
         glUniform1i(glGetUniformLocation(shaderProgram, "uNumBVHPrimitives"), mesh.GetNumBVHPrimitives());
@@ -783,32 +1010,51 @@ int main() {
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, view);
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, projection);
         
-        // Always bind texture1 sampler to avoid GL_INVALID_OPERATION
-        glActiveTexture(GL_TEXTURE1);
-        if (g_hasProjectedTexture) {
-            glBindTexture(GL_TEXTURE_2D, g_bakedTextureID);
+        // NEW: Texture array binding for Direct Mode (only if valid)
+        if (g_useTextureArray && g_textureArrayValid && g_enableUVGeneration && !g_isUnwrapped) {
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D_ARRAY, g_textureArray);
+            glUniform1i(glGetUniformLocation(shaderProgram, "textureArray"), 1);
+            
+            // Bind dummy texture to atlasTexture sampler (required even if not used)
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, g_textureID);
+            glUniform1i(glGetUniformLocation(shaderProgram, "atlasTexture"), 2);
+            
+            glUniform1i(glGetUniformLocation(shaderProgram, "useTexture"), 1);  // Direct mode
         } else {
-            glBindTexture(GL_TEXTURE_2D, g_textureID); // Bind source texture (won't be used unless useTexture=1)
+            // Always bind texture samplers to avoid GL_INVALID_OPERATION
+            glActiveTexture(GL_TEXTURE1);
+            if (g_hasProjectedTexture) {
+                glBindTexture(GL_TEXTURE_2D, g_bakedTextureID);
+            } else {
+                glBindTexture(GL_TEXTURE_2D, g_textureID); // Bind source texture
+            }
+            glUniform1i(glGetUniformLocation(shaderProgram, "texture1"), 1);
+            
+            // Bind dummy texture to texture array sampler (required even if not used)
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, g_textureID);
+            glUniform1i(glGetUniformLocation(shaderProgram, "atlasTexture"), 2);
         }
-        glUniform1i(glGetUniformLocation(shaderProgram, "texture1"), 1);
 
         glBindVertexArray(vao);
         
         if (g_isUnwrapped) {
             // After unwrap, still use vertex colors unless projection baked
             if (g_hasProjectedTexture) {
-                glUniform1i(glGetUniformLocation(shaderProgram, "useTexture"), 1);
+                glUniform1i(glGetUniformLocation(shaderProgram, "useTexture"), 2);  // Single texture mode
             } else {
-                glUniform1i(glGetUniformLocation(shaderProgram, "useTexture"), 0);
+                glUniform1i(glGetUniformLocation(shaderProgram, "useTexture"), 0);  // SDF color
             }
             glDrawElements(GL_TRIANGLES, (GLsizei)g_indexCount, GL_UNSIGNED_INT, 0);
         } else {
-            glUniform1i(glGetUniformLocation(shaderProgram, "useTexture"), 0);
-            // Switch to DrawArrays for Triangle Soup
+            // Triangle soup mode - use texture array if enabled and valid
+            if (!g_useTextureArray || !g_textureArrayValid || !g_enableUVGeneration) {
+                glUniform1i(glGetUniformLocation(shaderProgram, "useTexture"), 0);  // SDF color
+            }
             glDrawArrays(GL_TRIANGLES, 0, mesh.GetTotalVertexCount());
         }
-        
-        checkGLErrors("draw");
 
         glfwSwapBuffers(window);
         glfwPollEvents();

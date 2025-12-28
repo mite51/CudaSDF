@@ -40,7 +40,12 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(Eigen)
 
-# Copy Assets
+# Copy Assets folder to build directories
+file(COPY ${CMAKE_SOURCE_DIR}/assets/ DESTINATION ${CMAKE_BINARY_DIR}/Release/assets)
+file(COPY ${CMAKE_SOURCE_DIR}/assets/ DESTINATION ${CMAKE_BINARY_DIR}/Debug/assets)
+file(COPY ${CMAKE_SOURCE_DIR}/assets/ DESTINATION ${CMAKE_BINARY_DIR}/assets)
+
+# Also copy individual test_pattern.jpg to root for backward compatibility
 file(COPY ${CMAKE_SOURCE_DIR}/assets/test_pattern.jpg DESTINATION ${CMAKE_BINARY_DIR}/Release)
 file(COPY ${CMAKE_SOURCE_DIR}/assets/test_pattern.jpg DESTINATION ${CMAKE_BINARY_DIR}/Debug)
 file(COPY ${CMAKE_SOURCE_DIR}/assets/test_pattern.jpg DESTINATION ${CMAKE_BINARY_DIR})

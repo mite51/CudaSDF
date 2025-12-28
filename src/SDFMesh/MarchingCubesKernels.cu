@@ -4,6 +4,14 @@
 
 #define EMPTY_SUBGRID -1
 
+// Math constants for CUDA (not always defined by default)
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+#ifndef M_PI_2
+#define M_PI_2 1.57079632679489661923
+#endif
+
 __constant__ float isoThreshold = 0.0f;
 
 // --------------------------------------------------------------------------
@@ -232,6 +240,181 @@ __device__ float3 dispBend(float3 p, float k) {
 }
 
 // --------------------------------------------------------------------------
+// UV Mapping Functions
+// --------------------------------------------------------------------------
+
+__device__ float2 uvSphere(float3 p) {
+    float len = length(p);
+    if (len < 1e-6f) return make_float2(0.5f, 0.5f);
+    
+    p = p * (1.0f / len);  // Normalize
+    float theta = atan2f(p.z, p.x);
+    float phi = asinf(clamp(p.y, -1.0f, 1.0f));
+    
+    return make_float2(
+        (theta + M_PI) / (2.0f * M_PI),
+        (phi + M_PI_2) / M_PI
+    );
+}
+
+__device__ float2 uvBox(float3 p, float3 normal) {
+    float3 absN = make_float3(fabsf(normal.x), fabsf(normal.y), fabsf(normal.z));
+    
+    if (absN.x > absN.y && absN.x > absN.z) {
+        // X-face
+        return make_float2(p.z * 0.5f + 0.5f, p.y * 0.5f + 0.5f);
+    } else if (absN.y > absN.z) {
+        // Y-face
+        return make_float2(p.x * 0.5f + 0.5f, p.z * 0.5f + 0.5f);
+    } else {
+        // Z-face
+        return make_float2(p.x * 0.5f + 0.5f, p.y * 0.5f + 0.5f);
+    }
+}
+
+__device__ float2 uvCylinder(float3 p, float height) {
+    float theta = atan2f(p.z, p.x);
+    float u = (theta + M_PI) / (2.0f * M_PI);
+    float v = clamp((p.y / height) * 0.5f + 0.5f, 0.0f, 1.0f);
+    return make_float2(u, v);
+}
+
+__device__ float2 uvTorus(float3 p, float majorRadius, float minorRadius) {
+    float theta = atan2f(p.z, p.x);
+    
+    float2 q = make_float2(length(make_float2(p.x, p.z)) - majorRadius, p.y);
+    float phi = atan2f(q.y, q.x);
+    
+    return make_float2(
+        (theta + M_PI) / (2.0f * M_PI),
+        (phi + M_PI) / (2.0f * M_PI)
+    );
+}
+
+__device__ float2 uvCapsule(float3 p, float height, float radius) {
+    // Similar to cylinder but handle hemispherical caps
+    if (p.y > height) {
+        // Top cap (sphere)
+        float3 pCap = make_float3(p.x, p.y - height, p.z);
+        return uvSphere(pCap);
+    } else if (p.y < 0.0f) {
+        // Bottom cap (sphere)
+        return uvSphere(p);
+    } else {
+        // Cylindrical body
+        return uvCylinder(p, height);
+    }
+}
+
+__device__ float2 uvCone(float3 p, float height) {
+    // Similar to cylinder
+    float theta = atan2f(p.z, p.x);
+    float u = (theta + M_PI) / (2.0f * M_PI);
+    float v = clamp((p.y / height) * 0.5f + 0.5f, 0.0f, 1.0f);
+    return make_float2(u, v);
+}
+
+__device__ float2 transformUV(float2 uv, float2 scale, float2 offset, float rotation) {
+    // Apply scale
+    uv = make_float2(uv.x * scale.x, uv.y * scale.y);
+    
+    // Apply rotation
+    if (fabsf(rotation) > 1e-6f) {
+        float c = cosf(rotation);
+        float s = sinf(rotation);
+        float2 rotated = make_float2(
+            uv.x * c - uv.y * s,
+            uv.x * s + uv.y * c
+        );
+        uv = rotated;
+    }
+    
+    // Apply offset
+    uv = uv + offset;
+    
+    return uv;
+}
+
+__device__ float3 approximateLocalNormal(float3 localPos, const SDFPrimitive& prim) {
+    // Simple gradient approximation based on primitive type
+    if (prim.type == SDF_SPHERE) {
+        float len = length(localPos);
+        return (len > 1e-6f) ? (localPos * (1.0f / len)) : make_float3(0.0f, 1.0f, 0.0f);
+    } else if (prim.type == SDF_BOX || prim.type == SDF_ROUNDED_BOX) {
+        float3 absP = abs_f3(localPos);
+        if (absP.x > absP.y && absP.x > absP.z) {
+            return make_float3(copysignf(1.0f, localPos.x), 0.0f, 0.0f);
+        } else if (absP.y > absP.z) {
+            return make_float3(0.0f, copysignf(1.0f, localPos.y), 0.0f);
+        } else {
+            return make_float3(0.0f, 0.0f, copysignf(1.0f, localPos.z));
+        }
+    }
+    
+    // Default: use position direction
+    float len = length(localPos);
+    return (len > 1e-6f) ? (localPos * (1.0f / len)) : make_float3(0.0f, 1.0f, 0.0f);
+}
+
+__device__ float2 computePrimitiveUV(
+    const SDFPrimitive& prim,
+    float3 localPos,
+    float time
+) {
+    float2 uv = make_float2(0.0f, 0.0f);
+    
+    // Compute normal approximation
+    float3 localNormal = approximateLocalNormal(localPos, prim);
+    
+    // Select UV mapping based on primitive type
+    switch(prim.type) {
+        case SDF_SPHERE:
+            uv = uvSphere(localPos);
+            break;
+        case SDF_BOX:
+        case SDF_ROUNDED_BOX:
+            uv = uvBox(localPos, localNormal);
+            break;
+        case SDF_CYLINDER:
+        case SDF_ROUNDED_CYLINDER:
+            uv = uvCylinder(localPos, prim.params[0]);
+            break;
+        case SDF_TORUS:
+            uv = uvTorus(localPos, prim.params[0], prim.params[1]);
+            break;
+        case SDF_CAPSULE:
+            uv = uvCapsule(localPos, prim.params[0], prim.params[1]);
+            break;
+        case SDF_CONE:
+        case SDF_ROUNDED_CONE:
+            uv = uvCone(localPos, prim.params[0]);
+            break;
+        case SDF_HEX_PRISM:
+        case SDF_TRIANGULAR_PRISM:
+            // Use cylindrical approximation
+            uv = uvCylinder(localPos, prim.params[1]);
+            break;
+        case SDF_ELLIPSOID:
+            // Use spherical mapping
+            uv = uvSphere(localPos);
+            break;
+        case SDF_OCTOHEDRON:
+            // Use box-like mapping
+            uv = uvBox(localPos, localNormal);
+            break;
+        default:
+            // Planar fallback (XY projection)
+            uv = make_float2(localPos.x * 0.5f + 0.5f, localPos.y * 0.5f + 0.5f);
+            break;
+    }
+    
+    // Apply UV transforms
+    uv = transformUV(uv, prim.uvScale, prim.uvOffset, prim.uvRotation);
+    
+    return uv;
+}
+
+// --------------------------------------------------------------------------
 // SDF Evaluation
 // --------------------------------------------------------------------------
 
@@ -241,9 +424,11 @@ __device__ bool intersectAABB(float3 p, float3 minB, float3 maxB, float min_d) {
     return dist < min_d;
 }
 
-__device__ void map(float3 p_world, const SDFGrid& grid, float time, float& outDist, float3& outColor) {
+__device__ void map(float3 p_world, const SDFGrid& grid, float time, float& outDist, float3& outColor, int& outPrimitiveID, float3& outLocalPos) {
     float d = 1e10f;
     float3 color = make_float3(0.0f, 0.0f, 0.0f);
+    int closestPrimID = -1;
+    float3 closestLocalPos = make_float3(0.0f, 0.0f, 0.0f);
 
     // BVH Traversal
     int stack[64];
@@ -269,6 +454,9 @@ __device__ void map(float3 p_world, const SDFGrid& grid, float time, float& outD
             float3 p = p_world - prim.position;
             p = invRotateVector(p, prim.rotation);
             p = make_float3(p.x / prim.scale.x, p.y / prim.scale.y, p.z / prim.scale.z);
+            
+            // STORE PRE-DISTORTION POSITION (for UV calculation)
+            float3 p_preDisp = p;
             
             if (prim.displacement == DISP_TWIST) p = dispTwist(p, prim.dispParams[0]);
             else if (prim.displacement == DISP_BEND) p = dispBend(p, prim.dispParams[0]);
@@ -300,33 +488,65 @@ __device__ void map(float3 p_world, const SDFGrid& grid, float time, float& outD
             if (d == 1e10f) {
                 d = d_prim;
                 color = prim.color;
+                closestPrimID = i;
+                closestLocalPos = p_preDisp;
             } else {
                 float h = 0.0f;
                 switch(prim.operation) {
                     case SDF_UNION:
-                        if (d_prim < d) { d = d_prim; color = prim.color; }
+                        if (d_prim < d) { 
+                            d = d_prim; 
+                            color = prim.color;
+                            closestPrimID = i;
+                            closestLocalPos = p_preDisp;
+                        }
                         break;
                     case SDF_SUBTRACT:
-                        d = opSubtract(d, d_prim);
-                        if (-d_prim > d) color = prim.color; 
+                        {
+                            float d_old = d;
+                            d = opSubtract(d, d_prim);
+                            if (d > d_old) {  // Subtracted surface is visible
+                                color = prim.color;
+                                closestPrimID = i;  // Interior uses cutter's UV
+                                closestLocalPos = p_preDisp;
+                            }
+                        }
                         break;
                     case SDF_INTERSECT:
-                        if (d_prim > d) { d = d_prim; color = prim.color; }
+                        if (d_prim > d) { 
+                            d = d_prim; 
+                            color = prim.color;
+                            closestPrimID = i;
+                            closestLocalPos = p_preDisp;
+                        }
                         break;
                     case SDF_UNION_BLEND:
                         h = clamp(0.5f + 0.5f * (d - d_prim) / prim.blendFactor, 0.0f, 1.0f);
                         d = mix(d, d_prim, h) - prim.blendFactor * h * (1.0f - h);
                         color = mix(color, prim.color, h);
+                        // Use dominant primitive for blending
+                        if (d_prim < d || h > 0.5f) {
+                            closestPrimID = i;
+                            closestLocalPos = p_preDisp;
+                        }
                         break;
                     case SDF_SUBTRACT_BLEND:
                         h = clamp(0.5f - 0.5f * (d + d_prim) / prim.blendFactor, 0.0f, 1.0f);
                         d = mix(d, -d_prim, h) + prim.blendFactor * h * (1.0f - h);
                         color = mix(color, prim.color, h);
+                        if (h > 0.5f) {
+                            closestPrimID = i;
+                            closestLocalPos = p_preDisp;
+                        }
                         break;
                     case SDF_INTERSECT_BLEND:
                         h = clamp(0.5f - 0.5f * (d - d_prim) / prim.blendFactor, 0.0f, 1.0f);
                         d = mix(d, d_prim, h) + prim.blendFactor * h * (1.0f - h);
                         color = mix(color, prim.color, h);
+                        if (d_prim > d || h > 0.5f) {
+                            closestPrimID = i;
+                            closestLocalPos = p_preDisp;
+                        }
                         break;
                 }
             }
@@ -339,11 +559,13 @@ __device__ void map(float3 p_world, const SDFGrid& grid, float time, float& outD
     // Global Primitives (Non-Union)
     for (int i = grid.numBVHPrimitives; i < grid.numPrimitives; ++i) {
         SDFPrimitive prim = grid.d_primitives[i];
-        // ... same logic as above ... 
-        // Simplified reuse to save tokens/lines, assumes identical logic
+        
         float3 p = p_world - prim.position;
         p = invRotateVector(p, prim.rotation);
         p = make_float3(p.x / prim.scale.x, p.y / prim.scale.y, p.z / prim.scale.z);
+        
+        // STORE PRE-DISTORTION POSITION
+        float3 p_preDisp = p;
         
         if (prim.displacement == DISP_TWIST) p = dispTwist(p, prim.dispParams[0]);
         else if (prim.displacement == DISP_BEND) p = dispBend(p, prim.dispParams[0]);
@@ -370,30 +592,76 @@ __device__ void map(float3 p_world, const SDFGrid& grid, float time, float& outD
         if (prim.annular > 0.0f) d_prim = fabsf(d_prim) - prim.annular;
         if (prim.rounding > 0.0f) d_prim -= prim.rounding;
 
-        if (d == 1e10f) { d = d_prim; color = prim.color; }
+        if (d == 1e10f) { 
+            d = d_prim; 
+            color = prim.color;
+            closestPrimID = i;
+            closestLocalPos = p_preDisp;
+        }
         else {
             float h = 0.0f;
             switch(prim.operation) {
-                case SDF_UNION: if (d_prim < d) { d = d_prim; color = prim.color; } break;
-                case SDF_SUBTRACT: d = opSubtract(d, d_prim); if (-d_prim > d) color = prim.color; break;
-                case SDF_INTERSECT: if (d_prim > d) { d = d_prim; color = prim.color; } break;
+                case SDF_UNION: 
+                    if (d_prim < d) { 
+                        d = d_prim; 
+                        color = prim.color;
+                        closestPrimID = i;
+                        closestLocalPos = p_preDisp;
+                    } 
+                    break;
+                case SDF_SUBTRACT: 
+                    {
+                        float d_old = d;
+                        d = opSubtract(d, d_prim); 
+                        if (d > d_old) { 
+                            color = prim.color;
+                            closestPrimID = i;
+                            closestLocalPos = p_preDisp;
+                        }
+                    }
+                    break;
+                case SDF_INTERSECT: 
+                    if (d_prim > d) { 
+                        d = d_prim; 
+                        color = prim.color;
+                        closestPrimID = i;
+                        closestLocalPos = p_preDisp;
+                    } 
+                    break;
                 case SDF_UNION_BLEND:
                     h = clamp(0.5f + 0.5f * (d - d_prim) / prim.blendFactor, 0.0f, 1.0f);
                     d = mix(d, d_prim, h) - prim.blendFactor * h * (1.0f - h);
-                    color = mix(color, prim.color, h); break;
+                    color = mix(color, prim.color, h);
+                    if (d_prim < d || h > 0.5f) {
+                        closestPrimID = i;
+                        closestLocalPos = p_preDisp;
+                    }
+                    break;
                 case SDF_SUBTRACT_BLEND:
                     h = clamp(0.5f - 0.5f * (d + d_prim) / prim.blendFactor, 0.0f, 1.0f);
                     d = mix(d, -d_prim, h) + prim.blendFactor * h * (1.0f - h);
-                    color = mix(color, prim.color, h); break;
+                    color = mix(color, prim.color, h);
+                    if (h > 0.5f) {
+                        closestPrimID = i;
+                        closestLocalPos = p_preDisp;
+                    }
+                    break;
                 case SDF_INTERSECT_BLEND:
                     h = clamp(0.5f - 0.5f * (d - d_prim) / prim.blendFactor, 0.0f, 1.0f);
                     d = mix(d, d_prim, h) + prim.blendFactor * h * (1.0f - h);
-                    color = mix(color, prim.color, h); break;
+                    color = mix(color, prim.color, h);
+                    if (d_prim > d || h > 0.5f) {
+                        closestPrimID = i;
+                        closestLocalPos = p_preDisp;
+                    }
+                    break;
             }
         }
     }
     outDist = d;
     outColor = color;
+    outPrimitiveID = closestPrimID;
+    outLocalPos = closestLocalPos;
 }
 
 // --------------------------------------------------------------------------
@@ -428,7 +696,10 @@ __global__ void scoutActiveBlocks(SDFGrid grid, float time) {
     
     float d;
     float3 c;
-    map(centerVoxel, grid, time, d, c);
+    int primID;       // Unused here
+    float3 localPos;  // Unused here
+    
+    map(centerVoxel, grid, time, d, c, primID, localPos);
     
     if (fabsf(d) <= r) {
         int id = atomicAdd(grid.d_activeBlockCount, 1);
@@ -491,7 +762,8 @@ __global__ void countActiveBlockTriangles(SDFGrid grid, float time) {
         
         float3 p = getLocation(grid, make_int4(xyz.x + dx, xyz.y + dy, xyz.z + dz, 0));
         float d; float3 c;
-        map(p, grid, time, d, c);
+        int primID; float3 localPos;
+        map(p, grid, time, d, c, primID, localPos);
         
         cubeVal[i] = d;
         // Treat exact-equality as "inside" to reduce corner-collapses.
@@ -541,7 +813,8 @@ __global__ void generateActiveBlockTriangles(SDFGrid grid, float time) {
         
         float3 p = getLocation(grid, make_int4(xyz.x + dx, xyz.y + dy, xyz.z + dz, 0));
         float d; float3 c;
-        map(p, grid, time, d, c);
+        int primID; float3 localPos;
+        map(p, grid, time, d, c, primID, localPos);
         
         cubeVal[i] = d;
         // Treat exact-equality as "inside" to reduce corner-collapses.
@@ -571,12 +844,36 @@ __global__ void generateActiveBlockTriangles(SDFGrid grid, float time) {
         for (int j = 0; j < 3; ++j) {
             const float3 p = pTri[j];
 
-            float dist; float3 color;
-            map(p, grid, time, dist, color);
+            float dist; 
+            float3 color;
+            int primitiveID;
+            float3 localPos;
+            
+            map(p, grid, time, dist, color, primitiveID, localPos);
 
             grid.d_vertices[write + j] = make_float4(p.x, p.y, p.z, 1.0f);
             if (grid.d_vertexColors) {
                 grid.d_vertexColors[write + j] = make_float4(color.x, color.y, color.z, 1.0f);
+            }
+            
+            // WRITE PRIMITIVE ID (actually texture ID for shader)
+            if (grid.d_primitiveIDs) {
+                // Write the texture ID from the primitive, not the primitive index
+                int texID = (primitiveID >= 0 && primitiveID < grid.numPrimitives) 
+                    ? grid.d_primitives[primitiveID].textureID 
+                    : 0;
+                // Cast to float for OpenGL compatibility
+                *((float*)&grid.d_primitiveIDs[write + j]) = (float)texID;
+            }
+            
+            // COMPUTE AND WRITE UVS
+            if (grid.d_uvCoords && primitiveID >= 0 && primitiveID < grid.numPrimitives) {
+                SDFPrimitive prim = grid.d_primitives[primitiveID];
+                float2 uv = computePrimitiveUV(prim, localPos, time);
+                grid.d_uvCoords[write + j] = uv;
+            } else if (grid.d_uvCoords) {
+                // Fallback for invalid primitive ID
+                grid.d_uvCoords[write + j] = make_float2(0.0f, 0.0f);
             }
         }
 
