@@ -154,6 +154,9 @@ struct SDFGrid {
     float2* d_uvCoords;     // Output UV coordinates (parallel to d_vertices)
     int* d_primitiveIDs;    // Which primitive each vertex came from
     
+    // Normal Output (NEW)
+    float4* d_normals;      // Output normals (parallel to d_vertices)
+    
     unsigned int maxVertices;
     unsigned int maxIndices;
     

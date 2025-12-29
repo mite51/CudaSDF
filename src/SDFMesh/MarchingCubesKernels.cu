@@ -668,6 +668,42 @@ __device__ void map(float3 p_world, const SDFGrid& grid, float time, float& outD
 }
 
 // --------------------------------------------------------------------------
+// Normal Computation Helper (must be after map() is defined)
+// --------------------------------------------------------------------------
+
+__device__ inline float3 computeNormal(float3 p, const SDFGrid& grid, float time) {
+    const float h = 0.001f;  // Small epsilon for finite differences
+    
+    float dist_c, dist_x, dist_y, dist_z;
+    float3 color_temp;
+    int primID_temp;
+    float3 localPos_temp;
+    
+    // Sample SDF at center and offset positions
+    map(p, grid, time, dist_c, color_temp, primID_temp, localPos_temp);
+    map(make_float3(p.x + h, p.y, p.z), grid, time, dist_x, color_temp, primID_temp, localPos_temp);
+    map(make_float3(p.x, p.y + h, p.z), grid, time, dist_y, color_temp, primID_temp, localPos_temp);
+    map(make_float3(p.x, p.y, p.z + h), grid, time, dist_z, color_temp, primID_temp, localPos_temp);
+    
+    // Compute gradient
+    float3 grad = make_float3(
+        dist_x - dist_c,
+        dist_y - dist_c,
+        dist_z - dist_c
+    );
+    
+    // Normalize
+    float len = sqrtf(grad.x * grad.x + grad.y * grad.y + grad.z * grad.z);
+    if (len > 1e-6f) {
+        grad = make_float3(grad.x / len, grad.y / len, grad.z / len);
+    } else {
+        grad = make_float3(0.0f, 1.0f, 0.0f);  // Default up vector
+    }
+    
+    return grad;
+}
+
+// --------------------------------------------------------------------------
 // Scout Kernel
 // --------------------------------------------------------------------------
 
@@ -857,6 +893,12 @@ __global__ void generateActiveBlockTriangles(SDFGrid grid, float time) {
             grid.d_vertices[write + j] = make_float4(p.x, p.y, p.z, 1.0f);
             if (grid.d_vertexColors) {
                 grid.d_vertexColors[write + j] = make_float4(color.x, color.y, color.z, 1.0f);
+            }
+            
+            // COMPUTE AND WRITE NORMALS
+            if (grid.d_normals) {
+                float3 normal = computeNormal(p, grid, time);
+                grid.d_normals[write + j] = make_float4(normal.x, normal.y, normal.z, 0.0f);
             }
             
             // WRITE PRIMITIVE ID (actually texture ID for shader)

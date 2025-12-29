@@ -28,6 +28,7 @@ GLuint shaderProgram;
 GLuint projectionShaderProgram; // Shader for projection baking
 GLuint vao, vbo, ibo, cbo, uvbo; // Added uvbo for texture coordinates
 GLuint primidbo; // NEW: Primitive ID buffer
+GLuint normalbo; // NEW: Normal buffer
 GLuint g_textureID = 0; // Source texture for projection
 GLuint g_bakedTextureID = 0; // Baked texture from projection
 GLuint g_textureArray = 0; // NEW: Texture array for multi-texture support
@@ -39,6 +40,7 @@ struct cudaGraphicsResource* cudaIBO; // Unused but kept for structure compatibi
 struct cudaGraphicsResource* cudaCBO;
 struct cudaGraphicsResource* cudaUVBO; // NEW: For UV coordinates
 struct cudaGraphicsResource* cudaPrimIDBO; // NEW: For primitive IDs
+struct cudaGraphicsResource* cudaNormalBO; // NEW: For normals
 
 GLuint uboPrimitives; // UBO Handle
 GLuint tboBVH, texBVH; // BVH Texture Buffer
@@ -52,6 +54,7 @@ bool g_hasProjectedTexture = false; // Track if texture has been projection bake
 bool g_enableUVGeneration = false; // DISABLE to test basic rendering
 bool g_useTextureArray = false; // DISABLE to test basic rendering
 bool g_textureArrayValid = false; // NEW: Track if texture array loaded successfully
+bool g_useVertexNormals = true; // NEW: Use precomputed vertex normals (better for displacements)
 uint32_t g_indexCount = 0; // Number of indices for indexed drawing
 
 void checkGLErrors(const char* label) {
@@ -285,6 +288,10 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
             g_enableUVGeneration = !g_enableUVGeneration;
             std::cout << "UV generation: " << (g_enableUVGeneration ? "ON" : "OFF") << std::endl;
         }
+        if (key == GLFW_KEY_N) {  // NEW: Toggle vertex normals
+            g_useVertexNormals = !g_useVertexNormals;
+            std::cout << "Vertex normals: " << (g_useVertexNormals ? "ON (accurate)" : "OFF (SDF gradient)") << std::endl;
+        }
         if (key == GLFW_KEY_SPACE) {  // NEW: Toggle animation
             g_AnimateMesh = !g_AnimateMesh;
             std::cout << "Animation: " << (g_AnimateMesh ? "ON" : "OFF") << std::endl;
@@ -407,6 +414,7 @@ void initGL() {
     glGenBuffers(1, &cbo);
     glGenBuffers(1, &ibo);
     glGenBuffers(1, &uvbo); // Buffer for texture coordinates
+    glGenBuffers(1, &normalbo); // NEW: Buffer for normals
 
     // Load Texture
     g_textureID = LoadTexture("test_pattern.jpg");
@@ -428,6 +436,12 @@ void initGL() {
     glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
     // DON'T enable - shader doesn't use aColor
     // glEnableVertexAttribArray(1);
+    
+    // NEW: Normal Buffer (float4 normals, location 1 - REPLACING the color buffer slot)
+    glBindBuffer(GL_ARRAY_BUFFER, normalbo);
+    glBufferData(GL_ARRAY_BUFFER, maxVerts * sizeof(float) * 4, NULL, GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(1);  // Enable for normals
     
     // UVBO (vec2 texture coordinates, location 2)
     glBindBuffer(GL_ARRAY_BUFFER, uvbo);
@@ -469,6 +483,13 @@ void initGL() {
     cudaError_t errPrimIDBO = cudaGraphicsGLRegisterBuffer(&cudaPrimIDBO, primidbo, cudaGraphicsRegisterFlagsWriteDiscard);
     if (errPrimIDBO != cudaSuccess) {
         std::cerr << "CUDA Error Register PrimIDBO: " << cudaGetErrorString(errPrimIDBO) << std::endl;
+        exit(-1);
+    }
+    
+    // NEW: Register Normal buffer with CUDA
+    cudaError_t errNormalBO = cudaGraphicsGLRegisterBuffer(&cudaNormalBO, normalbo, cudaGraphicsRegisterFlagsWriteDiscard);
+    if (errNormalBO != cudaSuccess) {
+        std::cerr << "CUDA Error Register NormalBO: " << cudaGetErrorString(errNormalBO) << std::endl;
         exit(-1);
     }
     
@@ -821,6 +842,18 @@ int main() {
     glDisable(GL_CULL_FACE); // Disable culling to see both sides
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 
+    // Print controls to console
+    std::cout << "\n=== CONTROLS ===" << std::endl;
+    std::cout << "W: Toggle wireframe" << std::endl;
+    std::cout << "V: Toggle UV generation" << std::endl;
+    std::cout << "T: Toggle texture array mode" << std::endl;
+    std::cout << "N: Toggle vertex normals (ON=accurate for displacements, OFF=SDF gradient)" << std::endl;
+    std::cout << "U: Unwrap mesh" << std::endl;
+    std::cout << "P: Perform projection baking" << std::endl;
+    std::cout << "SPACE: Toggle animation" << std::endl;
+    std::cout << "ESC: Exit" << std::endl;
+    std::cout << "================\n" << std::endl;
+
     double lastFPSTime = glfwGetTime();
     int frameCount = 0;
 
@@ -853,6 +886,14 @@ int main() {
             // Map GL buffers
             if (cudaGraphicsMapResources(1, &cudaVBO, 0) != cudaSuccess) break;
             if (cudaGraphicsMapResources(1, &cudaCBO, 0) != cudaSuccess) break;
+            
+            // NEW: Map Normal buffer (always enabled for better lighting)
+            cudaError_t normalErr = cudaGraphicsMapResources(1, &cudaNormalBO, 0);
+            if (normalErr != cudaSuccess) {
+                std::cerr << "ERROR mapping NormalBO: " << cudaGetErrorString(normalErr) << std::endl;
+                break;
+            }
+            
             // NEW: Map UV and Primitive ID buffers if UV generation is enabled
             if (g_enableUVGeneration) {
                 cudaError_t uvErr = cudaGraphicsMapResources(1, &cudaUVBO, 0);
@@ -870,6 +911,7 @@ int main() {
             
             float4* d_vboPtr;
             float4* d_cboPtr;
+            float4* d_normalPtr = nullptr;
             unsigned int* d_iboPtr = nullptr;
             float2* d_uvPtr = nullptr;
             int* d_primIDPtr = nullptr;
@@ -877,6 +919,7 @@ int main() {
             
             cudaGraphicsResourceGetMappedPointer((void**)&d_vboPtr, &size, cudaVBO);
             cudaGraphicsResourceGetMappedPointer((void**)&d_cboPtr, &size, cudaCBO);
+            cudaGraphicsResourceGetMappedPointer((void**)&d_normalPtr, &size, cudaNormalBO);
             
             // NEW: Get UV and Primitive ID pointers
             if (g_enableUVGeneration) {
@@ -891,11 +934,12 @@ int main() {
                 }
             }
             
-            // Update mesh with UV generation
-            mesh.Update(time, d_vboPtr, d_cboPtr, d_iboPtr, d_uvPtr, d_primIDPtr);
+            // Update mesh with UV generation and normals
+            mesh.Update(time, d_vboPtr, d_cboPtr, d_iboPtr, d_uvPtr, d_primIDPtr, d_normalPtr);
             
             cudaGraphicsUnmapResources(1, &cudaVBO, 0);
             cudaGraphicsUnmapResources(1, &cudaCBO, 0);
+            cudaGraphicsUnmapResources(1, &cudaNormalBO, 0);
             // NEW: Unmap UV and Primitive ID buffers
             if (g_enableUVGeneration) {
                 cudaGraphicsUnmapResources(1, &cudaUVBO, 0);
@@ -996,6 +1040,7 @@ int main() {
         glUniform1f(glGetUniformLocation(shaderProgram, "time"), time);
         glUniform1i(glGetUniformLocation(shaderProgram, "uNumBVHPrimitives"), mesh.GetNumBVHPrimitives());
         glUniform1i(glGetUniformLocation(shaderProgram, "uNumTotalPrimitives"), (int)currentGPUPrimitives.size());
+        glUniform1i(glGetUniformLocation(shaderProgram, "useVertexNormals"), g_useVertexNormals ? 1 : 0);
         
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_BUFFER, texBVH);

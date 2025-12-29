@@ -78,7 +78,7 @@ inline SDFPrimitive CreateRoundedCylinderPrim(float3 position, float4 rotation, 
 inline const char* vertexShaderSource = R"(
     #version 330 core
     layout (location = 0) in vec4 aPos;
-    // location 1 removed - not using vertex colors with texture array
+    layout (location = 1) in vec4 aNormal;  // NEW: Vertex normal
     layout (location = 2) in vec2 aTexCoord;
     layout (location = 3) in float aPrimitiveID;  // Back to float for compatibility
     
@@ -88,6 +88,7 @@ inline const char* vertexShaderSource = R"(
     
     out vec3 FragPos;
     out vec3 FragPosWorld;
+    out vec3 Normal;  // NEW: Pass normal to fragment shader
     out vec2 TexCoord;
     out vec4 VertColor;
     flat out int PrimitiveID;  // NEW: flat = no interpolation
@@ -97,6 +98,11 @@ inline const char* vertexShaderSource = R"(
         gl_Position = projection * view * worldPos;
         FragPos = aPos.xyz;
         FragPosWorld = worldPos.xyz;
+        
+        // Transform normal to world space
+        mat3 normalMatrix = transpose(inverse(mat3(model)));
+        Normal = normalize(normalMatrix * aNormal.xyz);
+        
         TexCoord = aTexCoord;
         VertColor = vec4(1.0);  // Default white since we're not using vertex colors
         PrimitiveID = int(aPrimitiveID);  // Convert float to int
@@ -108,6 +114,7 @@ inline const char* fragmentShaderSource = R"(
     out vec4 FragColor;
     in vec3 FragPos;
     in vec3 FragPosWorld;
+    in vec3 Normal;  // NEW: Vertex normal from vertex shader
     in vec2 TexCoord;
     in vec4 VertColor;
     flat in int PrimitiveID;  // NEW: Primitive ID (flat = no interpolation)
@@ -118,6 +125,7 @@ inline const char* fragmentShaderSource = R"(
     uniform sampler2D atlasTexture;  // For atlas mode (single packed texture)
     uniform sampler2DArray textureArray;  // NEW: 2D texture array for multiple textures
     uniform int useTexture;  // 0 = SDF Color, 1 = Texture Array, 2 = Single Texture (legacy/atlas)
+    uniform bool useVertexNormals;  // NEW: Toggle between vertex normals and recomputed normals
     
     struct Primitive {
         vec4 info; // x=type, y=op, z=disp, w=blend
@@ -435,22 +443,26 @@ inline const char* fragmentShaderSource = R"(
     }
 
     void main() {
-        vec3 norm = normalize(FragPos); 
+        vec3 lightDir = normalize(vec3(1.0, 1.0, 1.0));
+        
+        vec3 normal;
+        if (useVertexNormals) {
+            // Use precomputed vertex normals (accurate for displaced geometry)
+            normal = normalize(Normal);
+        } else {
+            // Fallback: Recompute normal using SDF gradient (old method)
+            vec2 e = vec2(0.001, 0.0);
+            float d_center; vec3 c_center;
+            map(FragPos, d_center, c_center);
+            float d_x; vec3 c_x; map(FragPos + e.xyy, d_x, c_x);
+            float d_y; vec3 c_y; map(FragPos + e.yxy, d_y, c_y);
+            float d_z; vec3 c_z; map(FragPos + e.yyx, d_z, c_z);
+            normal = normalize(vec3(d_x - d_center, d_y - d_center, d_z - d_center));
+        }
         
         float d; 
         vec3 sdfColor;
         map(FragPos, d, sdfColor);
-        
-        vec3 lightDir = normalize(vec3(1.0, 1.0, 1.0));
-        
-        // Recalculate normal
-        vec2 e = vec2(0.001, 0.0);
-        float d_center; vec3 c_center;
-        map(FragPos, d_center, c_center);
-        float d_x; vec3 c_x; map(FragPos + e.xyy, d_x, c_x);
-        float d_y; vec3 c_y; map(FragPos + e.yxy, d_y, c_y);
-        float d_z; vec3 c_z; map(FragPos + e.yyx, d_z, c_z);
-        vec3 normal = normalize(vec3(d_x - d_center, d_y - d_center, d_z - d_center));
         
         float diff = max(dot(normal, lightDir), 0.0);
         vec3 color;

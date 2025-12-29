@@ -221,7 +221,7 @@ CudaSDFMesh::MemStats CudaSDFMesh::GetMemoryStats() const {
 }
 
 void CudaSDFMesh::Update(float time, float4* d_outVertices, float4* d_outColors, unsigned int* d_outIndices,
-                         float2* d_outUVs, int* d_outPrimitiveIDs) {
+                         float2* d_outUVs, int* d_outPrimitiveIDs, float4* d_outNormals) {
     UpdateBVH();
     
     // Upload Primitives
@@ -258,6 +258,7 @@ void CudaSDFMesh::Update(float time, float4* d_outVertices, float4* d_outColors,
     d_grid.d_indices = d_outIndices;
     d_grid.d_uvCoords = d_outUVs;              // NEW
     d_grid.d_primitiveIDs = d_outPrimitiveIDs; // NEW
+    d_grid.d_normals = d_outNormals;           // NEW
     d_grid.d_totalVertices = d_totalVertsPtr;
     d_grid.d_totalIndices = d_totalIndicesPtr;
     
