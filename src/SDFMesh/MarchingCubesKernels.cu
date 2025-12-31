@@ -879,42 +879,70 @@ __global__ void generateActiveBlockTriangles(SDFGrid grid, float time) {
 
         if (write + 2 >= grid.maxVertices) break;
 
+        // STEP 1: Evaluate all 3 vertices to get their individual data
+        float dist_v[3];
+        float3 color_v[3];
+        int primitiveID_v[3];
+        float3 localPos_v[3];
+        
+        #pragma unroll
+        for (int j = 0; j < 3; ++j) {
+            map(pTri[j], grid, time, dist_v[j], color_v[j], primitiveID_v[j], localPos_v[j]);
+        }
+        
+        // STEP 2: Choose DOMINANT primitive for the entire triangle
+        // Use the primitive at the triangle centroid for consistency
+        float3 triCenter = make_float3(
+            (pTri[0].x + pTri[1].x + pTri[2].x) / 3.0f,
+            (pTri[0].y + pTri[1].y + pTri[2].y) / 3.0f,
+            (pTri[0].z + pTri[1].z + pTri[2].z) / 3.0f
+        );
+        
+        float dist_center;
+        float3 color_center;
+        int dominantPrimID;
+        float3 localPos_center;
+        map(triCenter, grid, time, dist_center, color_center, dominantPrimID, localPos_center);
+        
+        // STEP 3: Write all 3 vertices using the SAME dominant primitive
         #pragma unroll
         for (int j = 0; j < 3; ++j) {
             const float3 p = pTri[j];
 
-            float dist; 
-            float3 color;
-            int primitiveID;
-            float3 localPos;
-            
-            map(p, grid, time, dist, color, primitiveID, localPos);
-
+            // Use per-vertex color (preserves smooth color transitions)
             grid.d_vertices[write + j] = make_float4(p.x, p.y, p.z, 1.0f);
             if (grid.d_vertexColors) {
-                grid.d_vertexColors[write + j] = make_float4(color.x, color.y, color.z, 1.0f);
+                grid.d_vertexColors[write + j] = make_float4(color_v[j].x, color_v[j].y, color_v[j].z, 1.0f);
             }
             
-            // COMPUTE AND WRITE NORMALS
+            // COMPUTE AND WRITE NORMALS (per-vertex for smooth shading)
             if (grid.d_normals) {
                 float3 normal = computeNormal(p, grid, time);
                 grid.d_normals[write + j] = make_float4(normal.x, normal.y, normal.z, 0.0f);
             }
             
-            // WRITE PRIMITIVE ID (actually texture ID for shader)
+            // WRITE PRIMITIVE ID - ALL vertices use DOMINANT primitive
             if (grid.d_primitiveIDs) {
-                // Write the texture ID from the primitive, not the primitive index
-                int texID = (primitiveID >= 0 && primitiveID < grid.numPrimitives) 
-                    ? grid.d_primitives[primitiveID].textureID 
+                int texID = (dominantPrimID >= 0 && dominantPrimID < grid.numPrimitives) 
+                    ? grid.d_primitives[dominantPrimID].textureID 
                     : 0;
-                // Cast to float for OpenGL compatibility
                 *((float*)&grid.d_primitiveIDs[write + j]) = (float)texID;
             }
             
-            // COMPUTE AND WRITE UVS
-            if (grid.d_uvCoords && primitiveID >= 0 && primitiveID < grid.numPrimitives) {
-                SDFPrimitive prim = grid.d_primitives[primitiveID];
-                float2 uv = computePrimitiveUV(prim, localPos, time);
+            // COMPUTE UVS - Transform vertex into DOMINANT primitive's local space
+            if (grid.d_uvCoords && dominantPrimID >= 0 && dominantPrimID < grid.numPrimitives) {
+                SDFPrimitive prim = grid.d_primitives[dominantPrimID];
+                
+                // Transform this vertex position into the dominant primitive's local space
+                float3 p_local = p - prim.position;
+                p_local = invRotateVector(p_local, prim.rotation);
+                p_local = make_float3(p_local.x / prim.scale.x, p_local.y / prim.scale.y, p_local.z / prim.scale.z);
+                
+                // Apply displacement inverse if needed (use pre-displacement position approximation)
+                // For now, we use the transformed position directly
+                // TODO: Could apply inverse displacement here for better accuracy
+                
+                float2 uv = computePrimitiveUV(prim, p_local, time);
                 grid.d_uvCoords[write + j] = uv;
             } else if (grid.d_uvCoords) {
                 // Fallback for invalid primitive ID
