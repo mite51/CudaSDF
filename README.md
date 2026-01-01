@@ -60,3 +60,7 @@ The implementation follows a standard GPU Marching Cubes pipeline:
 *   The application renders an animated sphere.
 *   Close the window to exit.
 
+
+<video src="https://raw.githubusercontent.com/mite51/CudaSDF/refs/heads/main/docs/demo.mp4" width="640" height="480" controls></video>
+
+
