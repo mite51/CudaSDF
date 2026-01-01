@@ -64,3 +64,8 @@ The implementation follows a standard GPU Marching Cubes pipeline:
 <video src="https://raw.githubusercontent.com/mite51/CudaSDF/refs/heads/main/docs/demo.mp4" width="640" height="480" controls></video>
 
 
+https://github.com/user-attachments/assets/6a263b1c-a9ff-4e95-b8bc-acf97b9f73b4
+
+
+
+
