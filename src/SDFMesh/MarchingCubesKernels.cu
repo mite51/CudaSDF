@@ -338,6 +338,146 @@ __device__ float2 transformUV(float2 uv, float2 scale, float2 offset, float rota
     return uv;
 }
 
+// --------------------------------------------------------------------------
+// Seam-Aware Triangle UV Computation
+// --------------------------------------------------------------------------
+
+// Forward declare approximateLocalNormal (defined after computePrimitiveUV)
+__device__ float3 approximateLocalNormal(float3 localPos, const SDFPrimitive& prim);
+
+/**
+ * Detects if a UV coordinate wraps across a seam and adjusts it to maintain coherence.
+ * @param uv The UV coordinate to potentially adjust
+ * @param reference The reference UV coordinate to compare against
+ * @param wrapThreshold The threshold for detecting a wrap (typically 0.5)
+ * @return The adjusted UV coordinate that is continuous with the reference
+ */
+__device__ float2 adjustUVForSeam(float2 uv, float2 reference, float wrapThreshold = 0.5f) {
+    float2 result = uv;
+    
+    // Check U coordinate
+    float deltaU = fabsf(uv.x - reference.x);
+    if (deltaU > wrapThreshold) {
+        // Seam detected - adjust to maintain coherence
+        if (uv.x < reference.x) {
+            result.x += 1.0f;  // Wrap up (0.02 becomes 1.02 to stay near 0.98)
+        } else {
+            result.x -= 1.0f;  // Wrap down (0.98 becomes -0.02 to stay near 0.02)
+        }
+    }
+    
+    // Check V coordinate
+    float deltaV = fabsf(uv.y - reference.y);
+    if (deltaV > wrapThreshold) {
+        // Seam detected - adjust to maintain coherence
+        if (uv.y < reference.y) {
+            result.y += 1.0f;
+        } else {
+            result.y -= 1.0f;
+        }
+    }
+    
+    return result;
+}
+
+/**
+ * Computes UVs for a triangle with seam awareness.
+ * This function computes all three UVs together and adjusts them to ensure
+ * they are continuous, even if that means going outside [0,1] range.
+ * 
+ * @param localPos Array of 3 local space positions
+ * @param prim The primitive being mapped
+ * @param time Current animation time
+ * @param outUVs Output array of 3 UV coordinates (must be pre-allocated)
+ */
+__device__ void computeTriangleUVs(
+    const float3 localPos[3],
+    const SDFPrimitive& prim,
+    float time,
+    float2 outUVs[3]
+) {
+    // Compute normal approximations for vertices that need them
+    float3 localNormals[3];
+    bool needsNormals = (prim.type == SDF_BOX || 
+                        prim.type == SDF_ROUNDED_BOX || 
+                        prim.type == SDF_OCTOHEDRON);
+    
+    if (needsNormals) {
+        for (int i = 0; i < 3; ++i) {
+            localNormals[i] = approximateLocalNormal(localPos[i], prim);
+        }
+    }
+    
+    // Step 1: Compute raw UVs for all three vertices
+    for (int i = 0; i < 3; ++i) {
+        float2 uv = make_float2(0.0f, 0.0f);
+        
+        switch(prim.type) {
+            case SDF_SPHERE:
+                uv = uvSphere(localPos[i]);
+                break;
+            case SDF_BOX:
+            case SDF_ROUNDED_BOX:
+                uv = uvBox(localPos[i], localNormals[i]);
+                break;
+            case SDF_CYLINDER:
+            case SDF_ROUNDED_CYLINDER:
+                uv = uvCylinder(localPos[i], prim.params[0]);
+                break;
+            case SDF_TORUS:
+                uv = uvTorus(localPos[i], prim.params[0], prim.params[1]);
+                break;
+            case SDF_CAPSULE:
+                uv = uvCapsule(localPos[i], prim.params[0], prim.params[1]);
+                break;
+            case SDF_CONE:
+            case SDF_ROUNDED_CONE:
+                uv = uvCone(localPos[i], prim.params[0]);
+                break;
+            case SDF_HEX_PRISM:
+            case SDF_TRIANGULAR_PRISM:
+                uv = uvCylinder(localPos[i], prim.params[1]);
+                break;
+            case SDF_ELLIPSOID:
+                uv = uvSphere(localPos[i]);
+                break;
+            case SDF_OCTOHEDRON:
+                uv = uvBox(localPos[i], localNormals[i]);
+                break;
+            default:
+                // Planar fallback
+                uv = make_float2(localPos[i].x * 0.5f + 0.5f, localPos[i].y * 0.5f + 0.5f);
+                break;
+        }
+        
+        outUVs[i] = uv;
+    }
+    
+    // Step 2: Detect and fix seam wrapping
+    // Use vertex 0 as the reference, adjust vertices 1 and 2 to be continuous with it
+    outUVs[1] = adjustUVForSeam(outUVs[1], outUVs[0]);
+    outUVs[2] = adjustUVForSeam(outUVs[2], outUVs[0]);
+    
+    // Additional check: if vertex 2 wrapped relative to vertex 0,
+    // but vertex 1 is actually closer to the wrapped vertex 2,
+    // we might need to adjust vertex 0 and 1 instead.
+    // This handles cases where the reference vertex is the outlier.
+    float dist_01 = fabsf(outUVs[0].x - outUVs[1].x) + fabsf(outUVs[0].y - outUVs[1].y);
+    float dist_02 = fabsf(outUVs[0].x - outUVs[2].x) + fabsf(outUVs[0].y - outUVs[2].y);
+    float dist_12 = fabsf(outUVs[1].x - outUVs[2].x) + fabsf(outUVs[1].y - outUVs[2].y);
+    
+    // If vertex 0 is far from both 1 and 2, but 1 and 2 are close,
+    // then vertex 0 is the outlier - adjust it to match vertex 1
+    if (dist_01 > 0.5f && dist_02 > 0.5f && dist_12 < 0.5f) {
+        outUVs[0] = adjustUVForSeam(outUVs[0], outUVs[1]);
+    }
+    
+    // Step 3: Apply UV transforms to all vertices
+    for (int i = 0; i < 3; ++i) {
+        outUVs[i] = transformUV(outUVs[i], prim.uvScale, prim.uvOffset, prim.uvRotation);
+    }
+}
+
 __device__ float3 approximateLocalNormal(float3 localPos, const SDFPrimitive& prim) {
     // Simple gradient approximation based on primitive type
     if (prim.type == SDF_SPHERE) {
@@ -904,7 +1044,31 @@ __global__ void generateActiveBlockTriangles(SDFGrid grid, float time) {
         float3 localPos_center;
         map(triCenter, grid, time, dist_center, color_center, dominantPrimID, localPos_center);
         
-        // STEP 3: Write all 3 vertices using the SAME dominant primitive
+        // STEP 3: Transform all 3 vertex positions to dominant primitive's local space
+        float3 localPositions[3];
+        if (dominantPrimID >= 0 && dominantPrimID < grid.numPrimitives) {
+            SDFPrimitive prim = grid.d_primitives[dominantPrimID];
+            
+            #pragma unroll
+            for (int j = 0; j < 3; ++j) {
+                float3 p_local = pTri[j] - prim.position;
+                p_local = invRotateVector(p_local, prim.rotation);
+                p_local = make_float3(p_local.x / prim.scale.x, p_local.y / prim.scale.y, p_local.z / prim.scale.z);
+                localPositions[j] = p_local;
+            }
+        }
+        
+        // STEP 4: Compute triangle-aware UVs with seam handling
+        float2 triangleUVs[3];
+        if (grid.d_uvCoords && dominantPrimID >= 0 && dominantPrimID < grid.numPrimitives) {
+            SDFPrimitive prim = grid.d_primitives[dominantPrimID];
+            computeTriangleUVs(localPositions, prim, time, triangleUVs);
+        } else {
+            // Fallback
+            triangleUVs[0] = triangleUVs[1] = triangleUVs[2] = make_float2(0.0f, 0.0f);
+        }
+        
+        // STEP 5: Write all 3 vertices
         #pragma unroll
         for (int j = 0; j < 3; ++j) {
             const float3 p = pTri[j];
@@ -929,24 +1093,9 @@ __global__ void generateActiveBlockTriangles(SDFGrid grid, float time) {
                 *((float*)&grid.d_primitiveIDs[write + j]) = (float)texID;
             }
             
-            // COMPUTE UVS - Transform vertex into DOMINANT primitive's local space
-            if (grid.d_uvCoords && dominantPrimID >= 0 && dominantPrimID < grid.numPrimitives) {
-                SDFPrimitive prim = grid.d_primitives[dominantPrimID];
-                
-                // Transform this vertex position into the dominant primitive's local space
-                float3 p_local = p - prim.position;
-                p_local = invRotateVector(p_local, prim.rotation);
-                p_local = make_float3(p_local.x / prim.scale.x, p_local.y / prim.scale.y, p_local.z / prim.scale.z);
-                
-                // Apply displacement inverse if needed (use pre-displacement position approximation)
-                // For now, we use the transformed position directly
-                // TODO: Could apply inverse displacement here for better accuracy
-                
-                float2 uv = computePrimitiveUV(prim, p_local, time);
-                grid.d_uvCoords[write + j] = uv;
-            } else if (grid.d_uvCoords) {
-                // Fallback for invalid primitive ID
-                grid.d_uvCoords[write + j] = make_float2(0.0f, 0.0f);
+            // WRITE UVS - Use pre-computed seam-aware triangle UVs
+            if (grid.d_uvCoords) {
+                grid.d_uvCoords[write + j] = triangleUVs[j];
             }
         }
 

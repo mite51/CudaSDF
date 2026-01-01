@@ -19,7 +19,7 @@
 #include "SDFMesh/TextureLoader.h"
 
 // Global variables
-const float GRID_SIZE = 128.0f; 
+const float GRID_SIZE = 64.0f; 
 const float CELL_SIZE = 1.0f/GRID_SIZE;
 const unsigned int WINDOW_WIDTH = 1024;
 const unsigned int WINDOW_HEIGHT = 768;
@@ -48,6 +48,7 @@ GLuint tboBVH, texBVH; // BVH Texture Buffer
 CudaSDFMesh mesh;
 bool g_triggerUnwrap = false;
 bool g_triggerProjection = false; // Flag to trigger projection baking
+bool g_triggerObjExport = false; // Flag to trigger OBJ export
 bool g_AnimateMesh = true; // Flag to control animation/update
 bool g_isUnwrapped = false; // Track if mesh has been unwrapped
 bool g_hasProjectedTexture = false; // Track if texture has been projection baked
@@ -291,6 +292,9 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
         if (key == GLFW_KEY_N) {  // NEW: Toggle vertex normals
             g_useVertexNormals = !g_useVertexNormals;
             std::cout << "Vertex normals: " << (g_useVertexNormals ? "ON (accurate)" : "OFF (SDF gradient)") << std::endl;
+        }
+        if (key == GLFW_KEY_O) {  // NEW: Export mesh to OBJ
+            g_triggerObjExport = true;
         }
         if (key == GLFW_KEY_SPACE) {  // NEW: Toggle animation
             g_AnimateMesh = !g_AnimateMesh;
@@ -718,6 +722,136 @@ void PerformProjectionBaking(const float* model, const float* view, const float*
     checkGLErrors("PerformProjectionBaking");
 }
 
+void ExportMeshToOBJ() {
+    std::cout << "Exporting mesh to OBJ..." << std::endl;
+    
+    // Generate timestamped filename
+    time_t now = time(nullptr);
+    struct tm timeinfo;
+    localtime_s(&timeinfo, &now);
+    char filename[256];
+    strftime(filename, sizeof(filename), "mesh_export_%Y%m%d_%H%M%S.obj", &timeinfo);
+    
+    std::ofstream objFile(filename);
+    if (!objFile.is_open()) {
+        std::cerr << "ERROR: Failed to open file for writing: " << filename << std::endl;
+        return;
+    }
+    
+    objFile << "# Exported from CudaSDF" << std::endl;
+    objFile << "# Generated: " << filename << std::endl;
+    objFile << std::endl;
+    
+    if (g_isUnwrapped) {
+        // Export unwrapped mesh with proper indexing
+        std::cout << "Exporting unwrapped mesh with " << g_indexCount << " indices..." << std::endl;
+        
+        // Read vertex positions from VBO
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        size_t vertexCount = g_indexCount; // Maximum possible vertices
+        std::vector<float4> vertices(vertexCount);
+        glGetBufferSubData(GL_ARRAY_BUFFER, 0, vertexCount * sizeof(float4), vertices.data());
+        
+        // Read UVs from UVBO
+        glBindBuffer(GL_ARRAY_BUFFER, uvbo);
+        std::vector<float2> uvs(vertexCount);
+        glGetBufferSubData(GL_ARRAY_BUFFER, 0, vertexCount * sizeof(float2), uvs.data());
+        
+        // Read indices from IBO
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+        std::vector<uint32_t> indices(g_indexCount);
+        glGetBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, g_indexCount * sizeof(uint32_t), indices.data());
+        
+        // Find actual unique vertex count
+        uint32_t maxIndex = 0;
+        for (uint32_t idx : indices) {
+            maxIndex = std::max(maxIndex, idx);
+        }
+        uint32_t actualVertexCount = maxIndex + 1;
+        
+        std::cout << "Unique vertices: " << actualVertexCount << ", Triangles: " << (g_indexCount / 3) << std::endl;
+        
+        // Write vertices
+        for (uint32_t i = 0; i < actualVertexCount; ++i) {
+            objFile << "v " << vertices[i].x << " " << vertices[i].y << " " << vertices[i].z << std::endl;
+        }
+        objFile << std::endl;
+        
+        // Write UVs
+        for (uint32_t i = 0; i < actualVertexCount; ++i) {
+            objFile << "vt " << uvs[i].x << " " << uvs[i].y << std::endl;
+        }
+        objFile << std::endl;
+        
+        // Write faces (OBJ uses 1-based indexing)
+        for (size_t i = 0; i < indices.size(); i += 3) {
+            uint32_t i0 = indices[i] + 1;
+            uint32_t i1 = indices[i + 1] + 1;
+            uint32_t i2 = indices[i + 2] + 1;
+            objFile << "f " << i0 << "/" << i0 << " " 
+                    << i1 << "/" << i1 << " " 
+                    << i2 << "/" << i2 << std::endl;
+        }
+        
+    } else {
+        // Export triangle soup (non-unwrapped mesh)
+        uint32_t vertexCount = mesh.GetTotalVertexCount();
+        std::cout << "Exporting triangle soup with " << vertexCount << " vertices..." << std::endl;
+        
+        if (vertexCount == 0) {
+            std::cout << "ERROR: No vertices to export!" << std::endl;
+            objFile.close();
+            return;
+        }
+        
+        // Read vertex positions from VBO
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        std::vector<float4> vertices(vertexCount);
+        glGetBufferSubData(GL_ARRAY_BUFFER, 0, vertexCount * sizeof(float4), vertices.data());
+        
+        // Read UVs from UVBO (if available)
+        std::vector<float2> uvs(vertexCount);
+        bool hasUVs = g_enableUVGeneration;
+        if (hasUVs) {
+            glBindBuffer(GL_ARRAY_BUFFER, uvbo);
+            glGetBufferSubData(GL_ARRAY_BUFFER, 0, vertexCount * sizeof(float2), uvs.data());
+        }
+        
+        // Write vertices
+        for (uint32_t i = 0; i < vertexCount; ++i) {
+            objFile << "v " << vertices[i].x << " " << vertices[i].y << " " << vertices[i].z << std::endl;
+        }
+        objFile << std::endl;
+        
+        // Write UVs if available
+        if (hasUVs) {
+            for (uint32_t i = 0; i < vertexCount; ++i) {
+                objFile << "vt " << uvs[i].x << " " << uvs[i].y << std::endl;
+            }
+            objFile << std::endl;
+        }
+        
+        // Write faces (triangle soup - each vertex is unique)
+        for (uint32_t i = 0; i < vertexCount; i += 3) {
+            uint32_t i0 = i + 1;
+            uint32_t i1 = i + 2;
+            uint32_t i2 = i + 3;
+            
+            if (hasUVs) {
+                objFile << "f " << i0 << "/" << i0 << " " 
+                        << i1 << "/" << i1 << " " 
+                        << i2 << "/" << i2 << std::endl;
+            } else {
+                objFile << "f " << i0 << " " << i1 << " " << i2 << std::endl;
+            }
+        }
+    }
+    
+    objFile.close();
+    std::cout << "Mesh exported successfully to: " << filename << std::endl;
+}
+
+
 
 int main() {
     initGL();
@@ -729,7 +863,7 @@ int main() {
 
     // Create Scene (Primitives Showcase)
     std::vector<SDFPrimitive> scenePrimitives;
-    
+
     // 1. Torus (green) - Checker pattern
     SDFPrimitive torus = CreateTorusPrim(
         make_float3(-0.5f, 0.5f, 0.0f),
@@ -850,6 +984,7 @@ int main() {
     std::cout << "N: Toggle vertex normals (ON=accurate for displacements, OFF=SDF gradient)" << std::endl;
     std::cout << "U: Unwrap mesh" << std::endl;
     std::cout << "P: Perform projection baking" << std::endl;
+    std::cout << "O: Export mesh to OBJ" << std::endl;
     std::cout << "SPACE: Toggle animation" << std::endl;
     std::cout << "ESC: Exit" << std::endl;
     std::cout << "================\n" << std::endl;
@@ -987,6 +1122,13 @@ int main() {
             glViewport(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
         }
         // ---------------------------------
+        
+        // --- OBJ Export Trigger ---
+        if (g_triggerObjExport) {
+            g_triggerObjExport = false;
+            ExportMeshToOBJ();
+        }
+        // --------------------------
 
         // Update UBO from Mesh (it might have sorted them)
         const auto& currentGPUPrimitives = mesh.GetGPUPrimitives();
