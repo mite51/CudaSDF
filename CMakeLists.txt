@@ -58,6 +58,7 @@ set(SOURCES
     src/main.cpp
     src/SDFMesh/CudaSDFMesh.cpp
     src/SDFMesh/MarchingCubesKernels.cu
+    src/SDFMesh/GridUVPacker.cu
     src/SDFMesh/Wrappers.cu
     src/uv_unwrap_harmonic_parameterization/common/mesh.cpp
     src/uv_unwrap_harmonic_parameterization/common/adjacency.cpp

@@ -1,0 +1,7 @@
+
+This project is currently creating a mesh from signed distance fields. The resulting mesh has UVs set from primitive based uv maps applied to that mesh. I would like to also add support for projection texture mapping, but for that to work, the mesh needs to have its UVs repacked into a single atlas.
+
+The attached document is a design for a cuda based UV packer. Please read and grok, if you have any questions or concerns, please feel free to ask for as much clarification as you need, otherwise proceed.
+
+When complete, it should be hooked up to "A" keypress to run and apply the packing, then be ready for projection mapping tests.
+

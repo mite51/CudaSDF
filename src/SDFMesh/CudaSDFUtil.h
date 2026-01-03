@@ -468,8 +468,9 @@ inline const char* fragmentShaderSource = R"(
         vec3 color;
         
         if (useTexture == 1) {
-            // DIRECT MODE: Sample texture array using primitive ID as layer
-            vec3 texColor = texture(textureArray, vec3(TexCoord.xy, float(PrimitiveID))).rgb;
+            // DIRECT MODE: Sample texture array using the primitive's textureID as layer
+            int layer = int(primitives[PrimitiveID].params3.z + 0.5);
+            vec3 texColor = texture(textureArray, vec3(TexCoord.xy, float(layer))).rgb;
             color = texColor * (diff + 0.2);
         } else if (useTexture == 2) {
             // SINGLE TEXTURE / ATLAS MODE: Use atlasTexture sampler
@@ -635,6 +636,9 @@ inline void packPrimitives(const std::vector<SDFPrimitive>& primitives, std::vec
         dst.params1[0] = src.params[0]; dst.params1[1] = src.params[1]; dst.params1[2] = src.params[2]; dst.params1[3] = src.params[3];
         dst.params2[0] = src.params[4]; dst.params2[1] = src.params[5]; 
         dst.params2[2] = src.dispParams[0]; dst.params2[3] = src.dispParams[1];
-        dst.params3[0] = src.dispParams[2]; dst.params3[1] = src.dispParams[3]; dst.params3[2] = 0.0f; dst.params3[3] = 0.0f;
+        dst.params3[0] = src.dispParams[2];
+        dst.params3[1] = src.dispParams[3];
+        dst.params3[2] = (float)src.textureID;      // expose texture layer to shader
+        dst.params3[3] = (float)src.atlasIslandID;  // reserved for atlas tooling/debug
     }
 }

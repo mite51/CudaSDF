@@ -12,6 +12,7 @@
 #include "SDFMesh/Commons.cuh"
 #include "SDFMesh/CudaSDFMesh.h"
 #include "SDFMesh/CudaSDFUtil.h" 
+#include "SDFMesh/GridUVPacker.cuh"
 #include "uv_unwrap_harmonic_parameterization/unwrap/unwrap_pipeline.h"
 #include "uv_unwrap_harmonic_parameterization/unwrap/seam_splitter.h"
 #include "uv_unwrap_harmonic_parameterization/common/mesh.h"
@@ -47,10 +48,12 @@ GLuint tboBVH, texBVH; // BVH Texture Buffer
 
 CudaSDFMesh mesh;
 bool g_triggerUnwrap = false;
+bool g_triggerAtlasPack = false; // NEW: CUDA atlas packing trigger
 bool g_triggerProjection = false; // Flag to trigger projection baking
 bool g_triggerObjExport = false; // Flag to trigger OBJ export
 bool g_AnimateMesh = true; // Flag to control animation/update
 bool g_isUnwrapped = false; // Track if mesh has been unwrapped
+bool g_isAtlasPacked = false; // NEW: Track if UVs have been repacked into a single atlas (triangle soup)
 bool g_hasProjectedTexture = false; // Track if texture has been projection baked
 bool g_enableUVGeneration = false; // DISABLE to test basic rendering
 bool g_useTextureArray = false; // DISABLE to test basic rendering
@@ -273,6 +276,9 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
         }
         if (key == GLFW_KEY_U) {
             g_triggerUnwrap = true;
+        }
+        if (key == GLFW_KEY_A) {
+            g_triggerAtlasPack = true;
         }
         if (key == GLFW_KEY_P) {
             g_triggerProjection = true;
@@ -641,8 +647,8 @@ void PerformUnwrap(const std::vector<float4>& rawVerts) {
 }
 
 void PerformProjectionBaking(const float* model, const float* view, const float* projection, int textureSize = 2048) {
-    if (!g_isUnwrapped) {
-        std::cout << "Mesh must be unwrapped first before projection baking!" << std::endl;
+    if (!g_isUnwrapped && !g_isAtlasPacked) {
+        std::cout << "Mesh must be unwrapped or atlas-packed before projection baking!" << std::endl;
         return;
     }
     
@@ -712,7 +718,12 @@ void PerformProjectionBaking(const float* model, const float* view, const float*
     
     // Draw the mesh
     glBindVertexArray(vao);
-    glDrawElements(GL_TRIANGLES, (GLsizei)g_indexCount, GL_UNSIGNED_INT, 0);
+    if (g_isUnwrapped) {
+        glDrawElements(GL_TRIANGLES, (GLsizei)g_indexCount, GL_UNSIGNED_INT, 0);
+    } else {
+        // Atlas-packed triangle soup path
+        glDrawArrays(GL_TRIANGLES, 0, mesh.GetTotalVertexCount());
+    }
     
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     
@@ -983,6 +994,7 @@ int main() {
     std::cout << "T: Toggle texture array mode" << std::endl;
     std::cout << "N: Toggle vertex normals (ON=accurate for displacements, OFF=SDF gradient)" << std::endl;
     std::cout << "U: Unwrap mesh" << std::endl;
+    std::cout << "A: CUDA atlas-pack existing UV charts (primitive UVs -> single atlas)" << std::endl;
     std::cout << "P: Perform projection baking" << std::endl;
     std::cout << "O: Export mesh to OBJ" << std::endl;
     std::cout << "SPACE: Toggle animation" << std::endl;
@@ -1113,6 +1125,67 @@ int main() {
             }
         }
         // -------------------------
+
+        // --- CUDA Atlas Pack Trigger (primitive UVs -> single atlas) ---
+        if (g_triggerAtlasPack) {
+            g_triggerAtlasPack = false;
+
+            if (!g_enableUVGeneration) {
+                std::cout << "UV generation is OFF. Press 'V' to enable UV generation before packing." << std::endl;
+            } else {
+                unsigned int count = mesh.GetTotalVertexCount();
+                if (count == 0) {
+                    std::cout << "Mesh is empty, cannot pack." << std::endl;
+                } else {
+                    // Map current buffers to run packer directly on CUDA/GL interop memory
+                    if (cudaGraphicsMapResources(1, &cudaVBO, 0) != cudaSuccess) break;
+                    if (cudaGraphicsMapResources(1, &cudaUVBO, 0) != cudaSuccess) break;
+                    if (cudaGraphicsMapResources(1, &cudaPrimIDBO, 0) != cudaSuccess) break;
+
+                    float4* d_vboPtr = nullptr;
+                    float2* d_uvPtr = nullptr;
+                    int* d_primIDPtr = nullptr;
+                    size_t size = 0;
+
+                    cudaGraphicsResourceGetMappedPointer((void**)&d_vboPtr, &size, cudaVBO);
+                    cudaGraphicsResourceGetMappedPointer((void**)&d_uvPtr, &size, cudaUVBO);
+                    cudaGraphicsResourceGetMappedPointer((void**)&d_primIDPtr, &size, cudaPrimIDBO);
+
+                    std::cout << "Running CUDA atlas packer on " << count << " vertices..." << std::endl;
+
+                    GridUVPacker::PackingConfig cfg;
+                    cfg.gridSize = 2048;         // board size in cells (v1)
+                    cfg.gridResolution = 64;     // quantization: cells per UV unit (v1 simplification)
+                    cfg.marginCells = 4;         // gutter
+                    cfg.enableRotation = true;   // 0° / 90°
+                    cfg.maxIterations = 256;     // number of attempts (capped internally)
+                    cfg.xAlignment = 8;          // aligned-X simplification
+                    cfg.maxCandidatesPerIsland = 16; // perf/quality balance (was 32)
+                    cfg.maxDropSteps = 256;          // cap downward probing to avoid worst-case stalls
+                    cfg.shuffleOrderPerAttempt = true;
+                    cfg.randomSeed = 1337;
+
+                    auto charts = GridUVPacker::ExtractCharts(d_vboPtr, d_uvPtr, d_primIDPtr, (int)count);
+                    auto islands = GridUVPacker::CreateIslands(charts, d_uvPtr, cfg.gridResolution, cfg.marginCells);
+                    auto atlas = GridUVPacker::PackIslands(islands, cfg);
+                    if (atlas.success) {
+                        GridUVPacker::RemapUVsToAtlas(d_uvPtr, d_primIDPtr, (int)count, charts, islands, atlas, cfg.gridResolution);
+                        g_isAtlasPacked = true;
+                        g_useTextureArray = false; // atlas mode uses a single texture
+                        g_AnimateMesh = false;     // freeze mesh so packed UVs remain stable for projection tests
+                        std::cout << "Atlas packing complete. UVs remapped into [0,1] atlas." << std::endl;
+                    } else {
+                        std::cout << "Atlas packing failed (partial/empty result). Try increasing gridSize or reducing margin/attempts." << std::endl;
+                    }
+                    GridUVPacker::FreeIslands(islands);
+
+                    cudaGraphicsUnmapResources(1, &cudaVBO, 0);
+                    cudaGraphicsUnmapResources(1, &cudaUVBO, 0);
+                    cudaGraphicsUnmapResources(1, &cudaPrimIDBO, 0);
+                }
+            }
+        }
+        // ------------------------------------------------------------
         
         // --- Projection Baking Trigger ---
         if (g_triggerProjection) {
@@ -1197,8 +1270,8 @@ int main() {
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, view);
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, projection);
         
-        // NEW: Texture array binding for Direct Mode (only if valid)
-        if (g_useTextureArray && g_textureArrayValid && g_enableUVGeneration && !g_isUnwrapped) {
+        // Texture array binding for Direct Mode (only if valid and not in atlas/unwrapped mode)
+        if (g_useTextureArray && g_textureArrayValid && g_enableUVGeneration && !g_isUnwrapped && !g_isAtlasPacked) {
             glActiveTexture(GL_TEXTURE1);
             glBindTexture(GL_TEXTURE_2D_ARRAY, g_textureArray);
             glUniform1i(glGetUniformLocation(shaderProgram, "textureArray"), 1);
@@ -1221,7 +1294,9 @@ int main() {
             
             // Bind dummy texture to texture array sampler (required even if not used)
             glActiveTexture(GL_TEXTURE2);
-            glBindTexture(GL_TEXTURE_2D, g_textureID);
+            // IMPORTANT: atlas mode samples `atlasTexture`, so bind the same 2D texture here too.
+            // (Projection baking writes to g_bakedTextureID; we want to display that when available.)
+            glBindTexture(GL_TEXTURE_2D, g_hasProjectedTexture ? g_bakedTextureID : g_textureID);
             glUniform1i(glGetUniformLocation(shaderProgram, "atlasTexture"), 2);
         }
 
@@ -1237,7 +1312,10 @@ int main() {
             glDrawElements(GL_TRIANGLES, (GLsizei)g_indexCount, GL_UNSIGNED_INT, 0);
         } else {
             // Triangle soup mode - use texture array if enabled and valid
-            if (!g_useTextureArray || !g_textureArrayValid || !g_enableUVGeneration) {
+            if (g_isAtlasPacked) {
+                // Atlas-packed UVs (single atlas texture)
+                glUniform1i(glGetUniformLocation(shaderProgram, "useTexture"), g_hasProjectedTexture ? 2 : 0);
+            } else if (!g_useTextureArray || !g_textureArrayValid || !g_enableUVGeneration) {
                 glUniform1i(glGetUniformLocation(shaderProgram, "useTexture"), 0);  // SDF color
             }
             glDrawArrays(GL_TRIANGLES, 0, mesh.GetTotalVertexCount());

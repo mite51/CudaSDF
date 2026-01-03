@@ -1087,10 +1087,9 @@ __global__ void generateActiveBlockTriangles(SDFGrid grid, float time) {
             
             // WRITE PRIMITIVE ID - ALL vertices use DOMINANT primitive
             if (grid.d_primitiveIDs) {
-                int texID = (dominantPrimID >= 0 && dominantPrimID < grid.numPrimitives) 
-                    ? grid.d_primitives[dominantPrimID].textureID 
-                    : 0;
-                *((float*)&grid.d_primitiveIDs[write + j]) = (float)texID;
+                // Store the primitive index (not the texture layer).
+                // The renderer can derive texture layer from the primitive UBO (see packPrimitives()).
+                *((float*)&grid.d_primitiveIDs[write + j]) = (float)dominantPrimID;
             }
             
             // WRITE UVS - Use pre-computed seam-aware triangle UVs
