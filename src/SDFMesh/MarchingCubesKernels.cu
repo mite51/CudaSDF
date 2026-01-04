@@ -1018,7 +1018,7 @@ __global__ void generateActiveBlockTriangles(SDFGrid grid, float time) {
         }
 
         if (write + 2 >= grid.maxVertices) break;
-
+/*        
         // STEP 1: Evaluate all 3 vertices to get their individual data
         float dist_v[3];
         float3 color_v[3];
@@ -1029,7 +1029,8 @@ __global__ void generateActiveBlockTriangles(SDFGrid grid, float time) {
         for (int j = 0; j < 3; ++j) {
             map(pTri[j], grid, time, dist_v[j], color_v[j], primitiveID_v[j], localPos_v[j]);
         }
-        
+   
+*/
         // STEP 2: Choose DOMINANT primitive for the entire triangle
         // Use the primitive at the triangle centroid for consistency
         float3 triCenter = make_float3(
@@ -1076,7 +1077,7 @@ __global__ void generateActiveBlockTriangles(SDFGrid grid, float time) {
             // Use per-vertex color (preserves smooth color transitions)
             grid.d_vertices[write + j] = make_float4(p.x, p.y, p.z, 1.0f);
             if (grid.d_vertexColors) {
-                grid.d_vertexColors[write + j] = make_float4(color_v[j].x, color_v[j].y, color_v[j].z, 1.0f);
+                grid.d_vertexColors[write + j] = make_float4(color_center.x, color_center.y, color_center.z, 1.0f);
             }
             
             // COMPUTE AND WRITE NORMALS (per-vertex for smooth shading)
@@ -1105,5 +1106,858 @@ __global__ void generateActiveBlockTriangles(SDFGrid grid, float time) {
         }
 
         write += 3;
+    }
+}
+
+// ==========================================================================
+// Dual Contouring (Option A: triangle soup)
+// - per-quad dominant primitive (sampled at quad center)
+// - normals via computeNormal() (SDF gradient, consistent w/ displacements)
+// - requires block->activeBlockId map to stitch across blocks
+// ==========================================================================
+
+__device__ __forceinline__ int linearBlockIndex(const int3& b, const int3& blocksDim) {
+    return b.x + b.y * blocksDim.x + b.z * blocksDim.x * blocksDim.y;
+}
+
+__device__ __forceinline__ int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+__device__ __forceinline__ float3 clamp3(float3 p, float3 lo, float3 hi) {
+    return make_float3(
+        clamp(p.x, lo.x, hi.x),
+        clamp(p.y, lo.y, hi.y),
+        clamp(p.z, lo.z, hi.z)
+    );
+}
+
+__device__ __forceinline__ float3 decodeCellVertexWorld(
+    const ushort4 q,
+    const float3 cellMin,
+    const float cellSize
+) {
+    const float inv = 1.0f / 65535.0f;
+    return make_float3(
+        cellMin.x + (float)q.x * inv * cellSize,
+        cellMin.y + (float)q.y * inv * cellSize,
+        cellMin.z + (float)q.z * inv * cellSize
+    );
+}
+
+__device__ __forceinline__ float3 decodeCellNormal(const short4 q) {
+    const float inv = 1.0f / 32767.0f;
+    float3 n = make_float3((float)q.x * inv, (float)q.y * inv, (float)q.z * inv);
+    const float len = sqrtf(n.x*n.x + n.y*n.y + n.z*n.z);
+    if (len > 1e-6f) n = make_float3(n.x/len, n.y/len, n.z/len);
+    else n = make_float3(0.0f, 1.0f, 0.0f);
+    return n;
+}
+
+__device__ __forceinline__ short4 encodeCellNormal(const float3 nIn) {
+    float3 n = nIn;
+    const float len = sqrtf(n.x*n.x + n.y*n.y + n.z*n.z);
+    if (len > 1e-6f) n = make_float3(n.x/len, n.y/len, n.z/len);
+    else n = make_float3(0.0f, 1.0f, 0.0f);
+
+    short4 out;
+    out.x = (short)clampi((int)lrintf(clamp(n.x, -1.0f, 1.0f) * 32767.0f), -32767, 32767);
+    out.y = (short)clampi((int)lrintf(clamp(n.y, -1.0f, 1.0f) * 32767.0f), -32767, 32767);
+    out.z = (short)clampi((int)lrintf(clamp(n.z, -1.0f, 1.0f) * 32767.0f), -32767, 32767);
+    out.w = 0;
+    return out;
+}
+
+__device__ __forceinline__ ushort4 encodeCellVertexLocal(const float3 pWorld, const float3 cellMin, float cellSize) {
+    float3 t = make_float3(
+        (pWorld.x - cellMin.x) / cellSize,
+        (pWorld.y - cellMin.y) / cellSize,
+        (pWorld.z - cellMin.z) / cellSize
+    );
+    t = clamp3(t, make_float3(0, 0, 0), make_float3(1, 1, 1));
+    ushort4 out;
+    out.x = (unsigned short)clampi((int)lrintf(t.x * 65535.0f), 0, 65535);
+    out.y = (unsigned short)clampi((int)lrintf(t.y * 65535.0f), 0, 65535);
+    out.z = (unsigned short)clampi((int)lrintf(t.z * 65535.0f), 0, 65535);
+    out.w = 0;
+    return out;
+}
+
+// Solve 3x3 linear system A x = b using Cramer's rule. Returns false if singular.
+__device__ __forceinline__ bool solve3x3(const float A[9], const float b[3], float x[3]) {
+    const float a00 = A[0], a01 = A[1], a02 = A[2];
+    const float a10 = A[3], a11 = A[4], a12 = A[5];
+    const float a20 = A[6], a21 = A[7], a22 = A[8];
+
+    const float det =
+        a00 * (a11 * a22 - a12 * a21) -
+        a01 * (a10 * a22 - a12 * a20) +
+        a02 * (a10 * a21 - a11 * a20);
+
+    if (fabsf(det) < 1e-12f) return false;
+    const float invDet = 1.0f / det;
+
+    const float bx = b[0], by = b[1], bz = b[2];
+    const float detX =
+        bx * (a11 * a22 - a12 * a21) -
+        a01 * (by * a22 - a12 * bz) +
+        a02 * (by * a21 - a11 * bz);
+
+    const float detY =
+        a00 * (by * a22 - a12 * bz) -
+        bx * (a10 * a22 - a12 * a20) +
+        a02 * (a10 * bz - by * a20);
+
+    const float detZ =
+        a00 * (a11 * bz - by * a21) -
+        a01 * (a10 * bz - by * a20) +
+        bx * (a10 * a21 - a11 * a20);
+
+    x[0] = detX * invDet;
+    x[1] = detY * invDet;
+    x[2] = detZ * invDet;
+    return true;
+}
+
+// Minimize sum_i (n_i · (x - p_i))^2  =>  (Σ n n^T) x = Σ n (n·p)
+__device__ __forceinline__ bool solveQEF(const float3* pts, const float3* ns, int m, float3& outX) {
+    if (m <= 0) return false;
+
+    float M[9] = {0};
+    float rhs[3] = {0, 0, 0};
+
+    for (int i = 0; i < m; ++i) {
+        float3 n = ns[i];
+        const float len = sqrtf(n.x * n.x + n.y * n.y + n.z * n.z);
+        if (len < 1e-6f) continue;
+        n = make_float3(n.x / len, n.y / len, n.z / len);
+        const float d = n.x * pts[i].x + n.y * pts[i].y + n.z * pts[i].z;
+
+        // M += n n^T
+        M[0] += n.x * n.x; M[1] += n.x * n.y; M[2] += n.x * n.z;
+        M[3] += n.y * n.x; M[4] += n.y * n.y; M[5] += n.y * n.z;
+        M[6] += n.z * n.x; M[7] += n.z * n.y; M[8] += n.z * n.z;
+
+        // rhs += n * d
+        rhs[0] += n.x * d;
+        rhs[1] += n.y * d;
+        rhs[2] += n.z * d;
+    }
+
+    // Regularize to stabilize corners/edges and blended SDF regions
+    const float lambda = 1e-5f;
+    M[0] += lambda; M[4] += lambda; M[8] += lambda;
+
+    float x[3];
+    if (!solve3x3(M, rhs, x)) return false;
+    outX = make_float3(x[0], x[1], x[2]);
+    return true;
+}
+
+// Regularized QEF with position bias: minimize Σ(n·(x-p))^2 + α||x-c||^2
+// => (M + αI) x = rhs + α c
+__device__ __forceinline__ bool solveQEFRegularized(
+    const float3* pts,
+    const float3* ns,
+    int m,
+    float alpha,
+    float3 c,
+    float3& outX
+) {
+    if (m <= 0) return false;
+
+    float M[9] = {0};
+    float rhs[3] = {0, 0, 0};
+
+    for (int i = 0; i < m; ++i) {
+        float3 n = ns[i];
+        const float len = sqrtf(n.x * n.x + n.y * n.y + n.z * n.z);
+        if (len < 1e-6f) continue;
+        n = make_float3(n.x / len, n.y / len, n.z / len);
+        const float d = n.x * pts[i].x + n.y * pts[i].y + n.z * pts[i].z;
+
+        M[0] += n.x * n.x; M[1] += n.x * n.y; M[2] += n.x * n.z;
+        M[3] += n.y * n.x; M[4] += n.y * n.y; M[5] += n.y * n.z;
+        M[6] += n.z * n.x; M[7] += n.z * n.y; M[8] += n.z * n.z;
+
+        rhs[0] += n.x * d;
+        rhs[1] += n.y * d;
+        rhs[2] += n.z * d;
+    }
+
+    // Bias toward centroid / cell center to stabilize near-planar regions
+    const float a = fmaxf(alpha, 0.0f);
+    M[0] += a; M[4] += a; M[8] += a;
+    rhs[0] += a * c.x;
+    rhs[1] += a * c.y;
+    rhs[2] += a * c.z;
+
+    // Mild extra regularization (keeps Cramer's stable)
+    const float lambda = 1e-6f;
+    M[0] += lambda; M[4] += lambda; M[8] += lambda;
+
+    float x[3];
+    if (!solve3x3(M, rhs, x)) return false;
+    outX = make_float3(x[0], x[1], x[2]);
+    return true;
+}
+
+__global__ void buildBlockToActiveMap(SDFGrid grid) {
+    const int activeBlockId = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (activeBlockId >= *grid.d_activeBlockCount) return;
+    const int blockIndex = grid.d_activeBlocks[activeBlockId];
+    if (blockIndex >= 0 && blockIndex < grid.maxBlocks) {
+        grid.d_blockToActiveId[blockIndex] = activeBlockId;
+    }
+}
+
+__global__ void dcMarkCells(SDFGrid grid, float time) {
+    const int activeBlockId = blockIdx.x;
+    if (activeBlockId >= *grid.d_activeBlockCount) return;
+
+    const int blockIndex = grid.d_activeBlocks[activeBlockId];
+    const int tid = (int)threadIdx.x;
+    const int packetIdx = activeBlockId * SDF_BLOCK_SIZE_CUBED + tid;
+
+    const int4 xyz = getGlobalCoordsFromBlock(blockIndex, tid, grid);
+    if (outOfBounds(grid, xyz)) {
+        grid.d_packetVertexCounts[packetIdx] = 0;
+        grid.d_dcCornerMasks[packetIdx] = 0;
+        return;
+    }
+
+    unsigned char mask = 0;
+
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int dx = marchingCubeCorners[i][0];
+        const int dy = marchingCubeCorners[i][1];
+        const int dz = marchingCubeCorners[i][2];
+        const float3 p = getLocation(grid, make_int4(xyz.x + dx, xyz.y + dy, xyz.z + dz, 0));
+        float d; float3 c; int primID; float3 localPos;
+        map(p, grid, time, d, c, primID, localPos);
+        if (d > isoThreshold) mask |= (1u << i);
+    }
+
+    grid.d_dcCornerMasks[packetIdx] = mask;
+
+    // Uniform mask => no surface in this cell
+    const bool allIn = (mask == 0xFF);
+    const bool allOut = (mask == 0x00);
+    grid.d_packetVertexCounts[packetIdx] = (allIn || allOut) ? 0u : 1u;
+}
+
+__global__ void dcSolveCellVertices(SDFGrid grid, float time, unsigned int maxCellVertices) {
+    const int activeBlockId = blockIdx.x;
+    if (activeBlockId >= *grid.d_activeBlockCount) return;
+
+    const int blockIndex = grid.d_activeBlocks[activeBlockId];
+    const int tid = (int)threadIdx.x;
+    const int packetIdx = activeBlockId * SDF_BLOCK_SIZE_CUBED + tid;
+
+    if (grid.d_packetVertexCounts[packetIdx] == 0) return; // no vertex
+
+    const int4 xyz = getGlobalCoordsFromBlock(blockIndex, tid, grid);
+    if (outOfBounds(grid, xyz)) return;
+
+    const unsigned int vIdx = grid.d_dcCellVertexOffsets[packetIdx];
+    if (vIdx >= maxCellVertices) return;
+
+    // Evaluate corners (values) again (keeps dcMarkCells simple; can optimize later)
+    float cubeVal[8];
+    unsigned char mask = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int dx = marchingCubeCorners[i][0];
+        const int dy = marchingCubeCorners[i][1];
+        const int dz = marchingCubeCorners[i][2];
+        const float3 p = getLocation(grid, make_int4(xyz.x + dx, xyz.y + dy, xyz.z + dz, 0));
+        float d; float3 c; int primID; float3 localPos;
+        map(p, grid, time, d, c, primID, localPos);
+        cubeVal[i] = d;
+        if (d > isoThreshold) mask |= (1u << i);
+    }
+
+    float3 pts[12];
+    float3 ns[12];
+    int m = 0;
+
+    // Hermite samples from sign-changing edges
+    #pragma unroll
+    for (int e = 0; e < 12; ++e) {
+        const int c1 = edgeConnections[e][0];
+        const int c2 = edgeConnections[e][1];
+        const bool s1 = ((mask >> c1) & 1) != 0;
+        const bool s2 = ((mask >> c2) & 1) != 0;
+        if (s1 == s2) continue;
+
+        const float t = safeEdgeT(cubeVal[c1], cubeVal[c2]);
+
+        const int4 pos1I = make_int4(
+            xyz.x + marchingCubeCorners[c1][0],
+            xyz.y + marchingCubeCorners[c1][1],
+            xyz.z + marchingCubeCorners[c1][2], 0);
+        const int4 pos2I = make_int4(
+            xyz.x + marchingCubeCorners[c2][0],
+            xyz.y + marchingCubeCorners[c2][1],
+            xyz.z + marchingCubeCorners[c2][2], 0);
+
+        const float3 p1 = getLocation(grid, pos1I);
+        const float3 p2 = getLocation(grid, pos2I);
+        const float3 p = lerp3(p1, p2, t);
+        const float3 n = computeNormal(p, grid, time);
+
+        pts[m] = p;
+        ns[m] = n;
+        m++;
+    }
+
+    // Fallback: if something went wrong, place at cell center
+    const float3 cellMin = getLocation(grid, xyz);
+    const float3 cellMax = make_float3(cellMin.x + grid.cellSize, cellMin.y + grid.cellSize, cellMin.z + grid.cellSize);
+    float3 x = make_float3(cellMin.x + 0.5f * grid.cellSize, cellMin.y + 0.5f * grid.cellSize, cellMin.z + 0.5f * grid.cellSize);
+    float3 pCentroid = x;
+    if (m > 0) {
+        float3 sum = make_float3(0, 0, 0);
+        for (int i = 0; i < m; ++i) sum = sum + pts[i];
+        const float invM = 1.0f / (float)m;
+        pCentroid = sum * invM;
+    }
+
+    // Feature-preserving heuristic: cluster normals into up to 3 dominant directions and try plane intersections
+    float3 clusterN[3] = {make_float3(0,0,0), make_float3(0,0,0), make_float3(0,0,0)};
+    float3 clusterP[3] = {make_float3(0,0,0), make_float3(0,0,0), make_float3(0,0,0)};
+    int clusterC[3] = {0,0,0};
+    int k = 0;
+    const float cosThresh = 0.92f; // ~23 degrees
+
+    for (int i = 0; i < m; ++i) {
+        float3 n = ns[i];
+        const float len = sqrtf(n.x*n.x + n.y*n.y + n.z*n.z);
+        if (len < 1e-6f) continue;
+        n = make_float3(n.x/len, n.y/len, n.z/len);
+
+        int best = -1;
+        float bestDot = -1.0f;
+        for (int ci = 0; ci < k; ++ci) {
+            float3 cn = clusterN[ci];
+            const float clen = sqrtf(cn.x*cn.x + cn.y*cn.y + cn.z*cn.z);
+            if (clen > 1e-6f) cn = make_float3(cn.x/clen, cn.y/clen, cn.z/clen);
+            const float d = fabsf(cn.x*n.x + cn.y*n.y + cn.z*n.z);
+            if (d > bestDot) { bestDot = d; best = ci; }
+        }
+
+        if (best >= 0 && bestDot > cosThresh) {
+            clusterN[best] = clusterN[best] + n;
+            clusterP[best] = clusterP[best] + pts[i];
+            clusterC[best]++;
+        } else if (k < 3) {
+            clusterN[k] = n;
+            clusterP[k] = pts[i];
+            clusterC[k] = 1;
+            k++;
+        } else {
+            // Assign to closest anyway
+            clusterN[best] = clusterN[best] + n;
+            clusterP[best] = clusterP[best] + pts[i];
+            clusterC[best]++;
+        }
+    }
+
+    bool solved = false;
+    // Only apply "feature preserving" plane intersections when clusters are clearly separated.
+    // Otherwise (smooth surfaces) fall back to standard QEF to avoid noisy/spiky silhouettes.
+    if (k >= 2) {
+        // Normalize cluster mean normals
+        float3 n1 = clusterN[0];
+        float3 n2 = clusterN[1];
+        float3 n3 = clusterN[2];
+        const float l1 = sqrtf(n1.x*n1.x + n1.y*n1.y + n1.z*n1.z);
+        const float l2 = sqrtf(n2.x*n2.x + n2.y*n2.y + n2.z*n2.z);
+        const float l3 = sqrtf(n3.x*n3.x + n3.y*n3.y + n3.z*n3.z);
+        if (l1 > 1e-6f && l2 > 1e-6f) {
+            n1 = make_float3(n1.x/l1, n1.y/l1, n1.z/l1);
+            n2 = make_float3(n2.x/l2, n2.y/l2, n2.z/l2);
+            if (l3 > 1e-6f) n3 = make_float3(n3.x/l3, n3.y/l3, n3.z/l3);
+
+            const float d12 = fabsf(dot(n1, n2));
+            const float d13 = (k >= 3 && l3 > 1e-6f) ? fabsf(dot(n1, n3)) : 1.0f;
+            const float d23 = (k >= 3 && l3 > 1e-6f) ? fabsf(dot(n2, n3)) : 1.0f;
+
+            // Require enough support in each cluster before treating it as a distinct feature plane.
+            const bool c01 = (clusterC[0] >= 2) && (clusterC[1] >= 2);
+            const bool c012 = c01 && (k >= 3) && (clusterC[2] >= 2) && (l3 > 1e-6f);
+
+            // Edge/corner thresholds (tuned to be conservative).
+            // Smaller dot => more orthogonal => sharper feature.
+            const float edgeDotThresh = 0.75f;   // ~41 degrees
+            const float cornerDotThresh = 0.80f; // ~37 degrees
+
+            bool doEdge = (k == 2) && c01 && (d12 < edgeDotThresh);
+            bool doCorner = (k >= 3) && c012 && (d12 < cornerDotThresh) && (d13 < cornerDotThresh) && (d23 < cornerDotThresh);
+
+            if (doEdge || doCorner) {
+                const float invC0 = 1.0f / (float)((clusterC[0] > 0) ? clusterC[0] : 1);
+                const float invC1 = 1.0f / (float)((clusterC[1] > 0) ? clusterC[1] : 1);
+                float3 p1 = clusterP[0] * invC0;
+                float3 p2 = clusterP[1] * invC1;
+
+                float A[9];
+                float b[3];
+
+                if (doEdge) {
+                    float3 nEdge = cross3(n1, n2);
+                    const float le = sqrtf(nEdge.x*nEdge.x + nEdge.y*nEdge.y + nEdge.z*nEdge.z);
+                    if (le > 1e-6f) {
+                        nEdge = make_float3(nEdge.x/le, nEdge.y/le, nEdge.z/le);
+                        // Anchor the 3rd plane with average point to select a stable point on the edge line.
+                        float3 pAvg = make_float3(0,0,0);
+                        for (int i = 0; i < m; ++i) pAvg = pAvg + pts[i];
+                        const float invM = 1.0f / (float)((m > 0) ? m : 1);
+                        pAvg = pAvg * invM;
+
+                        A[0]=n1.x;   A[1]=n1.y;   A[2]=n1.z;
+                        A[3]=n2.x;   A[4]=n2.y;   A[5]=n2.z;
+                        A[6]=nEdge.x;A[7]=nEdge.y;A[8]=nEdge.z;
+                        b[0]=dot(n1, p1);
+                        b[1]=dot(n2, p2);
+                        b[2]=dot(nEdge, pAvg);
+
+                        float sol[3];
+                        if (solve3x3(A, b, sol)) {
+                            x = make_float3(sol[0], sol[1], sol[2]);
+                            solved = true;
+                        }
+                    }
+                } else if (doCorner) {
+                    const float invC2 = 1.0f / (float)((clusterC[2] > 0) ? clusterC[2] : 1);
+                    float3 p3 = clusterP[2] * invC2;
+
+                    A[0]=n1.x; A[1]=n1.y; A[2]=n1.z;
+                    A[3]=n2.x; A[4]=n2.y; A[5]=n2.z;
+                    A[6]=n3.x; A[7]=n3.y; A[8]=n3.z;
+                    b[0]=dot(n1, p1);
+                    b[1]=dot(n2, p2);
+                    b[2]=dot(n3, p3);
+
+                    float sol[3];
+                    if (solve3x3(A, b, sol)) {
+                        x = make_float3(sol[0], sol[1], sol[2]);
+                        solved = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!solved) {
+        // Regularized QEF (stable on smooth surfaces)
+        // alpha tuned conservatively: strong enough to prevent wild solutions,
+        // weak enough to preserve detail where constraints are well-conditioned.
+        const float alpha = 0.05f;
+        if (!solveQEFRegularized(pts, ns, m, alpha, pCentroid, x)) {
+            (void)solveQEF(pts, ns, m, x);
+        }
+    }
+
+    // Soft clamp: allow a tiny margin to reduce discontinuities from hard clipping,
+    // then clamp to an expanded box and finally to the true cell bounds.
+    const float margin = 0.10f * grid.cellSize;
+    x = clamp3(x,
+        make_float3(cellMin.x - margin, cellMin.y - margin, cellMin.z - margin),
+        make_float3(cellMax.x + margin, cellMax.y + margin, cellMax.z + margin)
+    );
+    x = clamp3(x, cellMin, cellMax);
+    grid.d_dcCellVertices[vIdx] = encodeCellVertexLocal(x, cellMin, grid.cellSize);
+
+    // Store a smooth per-cell-vertex normal:
+    // Prefer averaged Hermite normals (stable across quads), fallback to SDF gradient at x.
+    if (grid.d_dcCellNormals) {
+        float3 nSum = make_float3(0, 0, 0);
+        for (int i = 0; i < m; ++i) nSum = nSum + ns[i];
+        const float len = sqrtf(nSum.x*nSum.x + nSum.y*nSum.y + nSum.z*nSum.z);
+        float3 nOut = (len > 1e-6f) ? make_float3(nSum.x/len, nSum.y/len, nSum.z/len) : computeNormal(x, grid, time);
+        // Ensure consistent orientation (outward) by matching the SDF gradient at the solved point.
+        {
+            const float3 nRef = computeNormal(x, grid, time);
+            if (dot(nOut, nRef) < 0.0f) {
+                nOut = make_float3(-nOut.x, -nOut.y, -nOut.z);
+            }
+        }
+        grid.d_dcCellNormals[vIdx] = encodeCellNormal(nOut);
+    }
+}
+
+// Helper: lookup packed-cell index for a global cell coordinate. Returns false if block not active.
+__device__ __forceinline__ bool lookupPackedCell(
+    const SDFGrid& grid,
+    int cx, int cy, int cz,
+    int& outPacketIdx
+) {
+    if (cx < 0 || cy < 0 || cz < 0) return false;
+    if (cx >= (int)grid.width - 1 || cy >= (int)grid.height - 1 || cz >= (int)grid.depth - 1) return false;
+
+    const int bx = cx / SDF_BLOCK_SIZE;
+    const int by = cy / SDF_BLOCK_SIZE;
+    const int bz = cz / SDF_BLOCK_SIZE;
+    if (bx < 0 || by < 0 || bz < 0 || bx >= grid.blocksDim.x || by >= grid.blocksDim.y || bz >= grid.blocksDim.z) return false;
+
+    const int blockIndex = bx + by * grid.blocksDim.x + bz * grid.blocksDim.x * grid.blocksDim.y;
+    const int activeBlockId = grid.d_blockToActiveId[blockIndex];
+    if (activeBlockId < 0) return false;
+
+    const int lx = cx - bx * SDF_BLOCK_SIZE;
+    const int ly = cy - by * SDF_BLOCK_SIZE;
+    const int lz = cz - bz * SDF_BLOCK_SIZE;
+    const int tid = lx + ly * SDF_BLOCK_SIZE + lz * (SDF_BLOCK_SIZE * SDF_BLOCK_SIZE);
+
+    outPacketIdx = activeBlockId * SDF_BLOCK_SIZE_CUBED + tid;
+    return true;
+}
+
+__global__ void dcSmoothCellNormals(SDFGrid grid, float cosAngleThreshold) {
+    const int activeBlockId = blockIdx.x;
+    if (activeBlockId >= *grid.d_activeBlockCount) return;
+
+    const int blockIndex = grid.d_activeBlocks[activeBlockId];
+    const int tid = (int)threadIdx.x;
+    const int packetIdx = activeBlockId * SDF_BLOCK_SIZE_CUBED + tid;
+
+    if (!grid.d_dcCellNormals || !grid.d_dcCellNormalsTmp) return;
+
+    const int4 xyz = getGlobalCoordsFromBlock(blockIndex, tid, grid);
+    if (outOfBounds(grid, xyz)) return;
+
+    const unsigned char mask = grid.d_dcCornerMasks[packetIdx];
+    if (mask == 0x00 || mask == 0xFF) return; // not a surface cell
+
+    const unsigned int vIdx = grid.d_dcCellVertexOffsets[packetIdx];
+    if (vIdx >= grid.maxVertices) return;
+
+    const float3 nSelf = decodeCellNormal(grid.d_dcCellNormals[vIdx]);
+    float3 nSum = nSelf;
+    int count = 1;
+
+    // 6-neighborhood smoothing (face-adjacent only), adaptive by angle threshold.
+    // This avoids smearing across diagonals which can bridge unrelated surface sheets near CSG seams.
+    const int3 offs[6] = {
+        make_int3( 1, 0, 0), make_int3(-1, 0, 0),
+        make_int3( 0, 1, 0), make_int3( 0,-1, 0),
+        make_int3( 0, 0, 1), make_int3( 0, 0,-1)
+    };
+
+    for (int i = 0; i < 6; ++i) {
+        int pN;
+        if (!lookupPackedCell(grid, xyz.x + offs[i].x, xyz.y + offs[i].y, xyz.z + offs[i].z, pN)) continue;
+        const unsigned char mN = grid.d_dcCornerMasks[pN];
+        if (mN == 0x00 || mN == 0xFF) continue;
+
+        const unsigned int vN = grid.d_dcCellVertexOffsets[pN];
+        if (vN >= grid.maxVertices) continue;
+        const float3 nNbr = decodeCellNormal(grid.d_dcCellNormals[vN]);
+
+        const float d = dot(nNbr, nSelf);
+        if (d >= cosAngleThreshold) {
+            // Weight neighbors by alignment so "almost threshold" has small influence.
+            const float w = (d - cosAngleThreshold) / fmaxf(1e-6f, (1.0f - cosAngleThreshold));
+            nSum = nSum + (w * nNbr);
+            count++;
+        }
+    }
+
+    const float len = sqrtf(nSum.x*nSum.x + nSum.y*nSum.y + nSum.z*nSum.z);
+    float3 nOut = (len > 1e-6f) ? make_float3(nSum.x/len, nSum.y/len, nSum.z/len) : nSelf;
+    grid.d_dcCellNormalsTmp[vIdx] = encodeCellNormal(nOut);
+}
+
+__global__ void dcCountQuads(SDFGrid grid) {
+    const int activeBlockId = blockIdx.x;
+    if (activeBlockId >= *grid.d_activeBlockCount) return;
+
+    const int blockIndex = grid.d_activeBlocks[activeBlockId];
+    const int tid = (int)threadIdx.x;
+    const int packetIdx = activeBlockId * SDF_BLOCK_SIZE_CUBED + tid;
+
+    const int4 xyz = getGlobalCoordsFromBlock(blockIndex, tid, grid);
+    if (outOfBounds(grid, xyz)) {
+        grid.d_packetVertexCounts[packetIdx] = 0;
+        return;
+    }
+
+    const unsigned char mask = grid.d_dcCornerMasks[packetIdx];
+    unsigned int count = 0;
+
+    // Only generate quads for edges emanating from the cell's min corner (corner 0):
+    // X edge: corners 0-1, Y edge: 0-3, Z edge: 0-4. This avoids duplicate edge ownership.
+    const bool s0 = (mask & 1) != 0;
+
+    // Helper: surface cell if mask is neither all-in nor all-out
+    auto isSurfaceCell = [&](int packet) {
+        const unsigned char m = grid.d_dcCornerMasks[packet];
+        return (m != 0x00) && (m != 0xFF);
+    };
+
+    // X edge (requires neighbor cells in -Y and -Z)
+    if (((mask >> 1) & 1) != (unsigned char)s0) {
+        if (xyz.y > 0 && xyz.z > 0) {
+            int pA, pB, pC, pD;
+            if (lookupPackedCell(grid, xyz.x,     xyz.y,     xyz.z,     pA) &&
+                lookupPackedCell(grid, xyz.x,     xyz.y - 1, xyz.z,     pB) &&
+                lookupPackedCell(grid, xyz.x,     xyz.y,     xyz.z - 1, pC) &&
+                lookupPackedCell(grid, xyz.x,     xyz.y - 1, xyz.z - 1, pD) &&
+                isSurfaceCell(pA) && isSurfaceCell(pB) && isSurfaceCell(pC) && isSurfaceCell(pD)) {
+                count += 6;
+            }
+        }
+    }
+
+    // Y edge (requires neighbor cells in -X and -Z)
+    if (((mask >> 3) & 1) != (unsigned char)s0) {
+        if (xyz.x > 0 && xyz.z > 0) {
+            int pA, pB, pC, pD;
+            if (lookupPackedCell(grid, xyz.x,     xyz.y,     xyz.z,     pA) &&
+                lookupPackedCell(grid, xyz.x - 1, xyz.y,     xyz.z,     pB) &&
+                lookupPackedCell(grid, xyz.x,     xyz.y,     xyz.z - 1, pC) &&
+                lookupPackedCell(grid, xyz.x - 1, xyz.y,     xyz.z - 1, pD) &&
+                isSurfaceCell(pA) && isSurfaceCell(pB) && isSurfaceCell(pC) && isSurfaceCell(pD)) {
+                count += 6;
+            }
+        }
+    }
+
+    // Z edge (requires neighbor cells in -X and -Y)
+    if (((mask >> 4) & 1) != (unsigned char)s0) {
+        if (xyz.x > 0 && xyz.y > 0) {
+            int pA, pB, pC, pD;
+            if (lookupPackedCell(grid, xyz.x,     xyz.y,     xyz.z,     pA) &&
+                lookupPackedCell(grid, xyz.x - 1, xyz.y,     xyz.z,     pB) &&
+                lookupPackedCell(grid, xyz.x,     xyz.y - 1, xyz.z,     pC) &&
+                lookupPackedCell(grid, xyz.x - 1, xyz.y - 1, xyz.z,     pD) &&
+                isSurfaceCell(pA) && isSurfaceCell(pB) && isSurfaceCell(pC) && isSurfaceCell(pD)) {
+                count += 6;
+            }
+        }
+    }
+
+    grid.d_packetVertexCounts[packetIdx] = count;
+}
+
+// Seam-aware UV for a quad: compute as two triangles (0,1,2) and (0,2,3) but keep consistent UVs.
+__device__ void computeQuadUVs(
+    const float3 localPos[4],
+    const SDFPrimitive& prim,
+    float time,
+    float2 outUVs[4]
+) {
+    float3 tri0[3] = { localPos[0], localPos[1], localPos[2] };
+    float3 tri1[3] = { localPos[0], localPos[2], localPos[3] };
+    float2 uv0[3], uv1[3];
+    computeTriangleUVs(tri0, prim, time, uv0);
+    computeTriangleUVs(tri1, prim, time, uv1);
+
+    // Use tri0 for verts 0,1,2; use tri1 for vert3; average shared verts for coherence.
+    outUVs[0] = (uv0[0] + uv1[0]) * 0.5f;
+    outUVs[1] = uv0[1];
+    outUVs[2] = (uv0[2] + uv1[1]) * 0.5f;
+    outUVs[3] = uv1[2];
+}
+
+__global__ void dcGenerateQuads(SDFGrid grid, float time) {
+    const int activeBlockId = blockIdx.x;
+    if (activeBlockId >= *grid.d_activeBlockCount) return;
+
+    const int blockIndex = grid.d_activeBlocks[activeBlockId];
+    const int tid = (int)threadIdx.x;
+    const int packetIdx = activeBlockId * SDF_BLOCK_SIZE_CUBED + tid;
+
+    const unsigned int first = grid.d_packetVertexOffsets[packetIdx];
+    const unsigned int emitCount = grid.d_packetVertexCounts[packetIdx];
+    if (emitCount == 0) return;
+
+    const int4 xyz = getGlobalCoordsFromBlock(blockIndex, tid, grid);
+    if (outOfBounds(grid, xyz)) return;
+
+    const unsigned char mask = grid.d_dcCornerMasks[packetIdx];
+    const bool s0 = (mask & 1) != 0;
+
+    unsigned int write = first;
+
+    // NOTE: For now, we will compute the four cell mins directly from the global coords, since those are cheap.
+    // Each packetIdx corresponds to a specific global cell (xyz). For neighbor packet indices we reconstruct their global coords
+    // by computing the cell coords from the packet's tid and active block. To avoid this overhead, a future optimization would store
+    // global cell coords per packet or decode via precomputed block coords.
+
+    auto packetToXYZ = [&](int packet, int4& outXYZ) {
+        const int ab = packet / SDF_BLOCK_SIZE_CUBED;
+        const int t = packet - ab * SDF_BLOCK_SIZE_CUBED;
+        const int bIndex = grid.d_activeBlocks[ab];
+        outXYZ = getGlobalCoordsFromBlock(bIndex, t, grid);
+    };
+
+    auto emitQuadFromPackets = [&](int p0, int p1, int p2, int p3) {
+        // Must be surface cells (otherwise offsets/vertices are undefined for those packets)
+        auto isSurface = [&](int packet) {
+            const unsigned char m = grid.d_dcCornerMasks[packet];
+            return (m != 0x00) && (m != 0xFF);
+        };
+        if (!isSurface(p0) || !isSurface(p1) || !isSurface(p2) || !isSurface(p3)) return;
+
+        int4 aXYZ, bXYZ, cXYZ, dXYZ;
+        packetToXYZ(p0, aXYZ);
+        packetToXYZ(p1, bXYZ);
+        packetToXYZ(p2, cXYZ);
+        packetToXYZ(p3, dXYZ);
+
+        const unsigned int i0 = grid.d_dcCellVertexOffsets[p0];
+        const unsigned int i1 = grid.d_dcCellVertexOffsets[p1];
+        const unsigned int i2 = grid.d_dcCellVertexOffsets[p2];
+        const unsigned int i3 = grid.d_dcCellVertexOffsets[p3];
+        if (i0 >= grid.maxVertices || i1 >= grid.maxVertices || i2 >= grid.maxVertices || i3 >= grid.maxVertices) return;
+
+        const float3 pMin0 = getLocation(grid, aXYZ);
+        const float3 pMin1 = getLocation(grid, bXYZ);
+        const float3 pMin2 = getLocation(grid, cXYZ);
+        const float3 pMin3 = getLocation(grid, dXYZ);
+
+        float3 v0 = decodeCellVertexWorld(grid.d_dcCellVertices[i0], pMin0, grid.cellSize);
+        float3 v1 = decodeCellVertexWorld(grid.d_dcCellVertices[i1], pMin1, grid.cellSize);
+        float3 v2 = decodeCellVertexWorld(grid.d_dcCellVertices[i2], pMin2, grid.cellSize);
+        float3 v3 = decodeCellVertexWorld(grid.d_dcCellVertices[i3], pMin3, grid.cellSize);
+
+        // Choose dominant primitive per-quad at quad center (world)
+        const float3 quadCenter = make_float3(
+            0.25f * (v0.x + v1.x + v2.x + v3.x),
+            0.25f * (v0.y + v1.y + v2.y + v3.y),
+            0.25f * (v0.z + v1.z + v2.z + v3.z)
+        );
+
+        // Guard against bad decode (shouldn't happen, but prevents catastrophic stretched tris)
+        if (!isFinite3(v0)) v0 = quadCenter;
+        if (!isFinite3(v1)) v1 = quadCenter;
+        if (!isFinite3(v2)) v2 = quadCenter;
+        if (!isFinite3(v3)) v3 = quadCenter;
+
+        // Enforce consistent winding against SDF gradient to avoid "spike" triangles from flipped quads.
+        // If the quad is oriented opposite the local surface normal, flip (swap v1 <-> v3).
+        bool didFlip = false;
+        {
+            const float3 nRef = computeNormal(quadCenter, grid, time);
+            const float3 nTri = cross3(v1 - v0, v2 - v0);
+            if (dot(nTri, nRef) < 0.0f) {
+                const float3 tmp = v1; v1 = v3; v3 = tmp;
+                didFlip = true;
+            }
+        }
+
+        float dist_center;
+        float3 color_center;
+        int dominantPrimID;
+        float3 localPos_center;
+        map(quadCenter, grid, time, dist_center, color_center, dominantPrimID, localPos_center);
+
+        // Transform quad vertices to dominant primitive local space for UVs
+        float2 quadUVs[4] = {make_float2(0,0), make_float2(0,0), make_float2(0,0), make_float2(0,0)};
+        if (grid.d_uvCoords && dominantPrimID >= 0 && dominantPrimID < (int)grid.numPrimitives) {
+            const SDFPrimitive prim = grid.d_primitives[dominantPrimID];
+            float3 localPos[4];
+            const float3 vw[4] = {v0, v1, v2, v3};
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                float3 p_local = vw[i] - prim.position;
+                p_local = invRotateVector(p_local, prim.rotation);
+                p_local = make_float3(p_local.x / prim.scale.x, p_local.y / prim.scale.y, p_local.z / prim.scale.z);
+                localPos[i] = p_local;
+            }
+            computeQuadUVs(localPos, prim, time, quadUVs);
+        }
+
+        // Fetch smooth per-cell-vertex normals (one per DC cell vertex), fallback to quadCenter gradient if not available.
+        float3 n0 = make_float3(0.0f, 1.0f, 0.0f);
+        float3 n1 = n0, n2 = n0, n3 = n0;
+        if (grid.d_dcCellNormals) {
+            // If we flipped winding by swapping v1/v3, we must also swap which cell-normal is paired with those vertices.
+            const unsigned int ni1 = didFlip ? i3 : i1;
+            const unsigned int ni3 = didFlip ? i1 : i3;
+            n0 = decodeCellNormal(grid.d_dcCellNormals[i0]);
+            n1 = decodeCellNormal(grid.d_dcCellNormals[ni1]);
+            n2 = decodeCellNormal(grid.d_dcCellNormals[i2]);
+            n3 = decodeCellNormal(grid.d_dcCellNormals[ni3]);
+        } else if (grid.d_normals) {
+            const float3 nRef = computeNormal(quadCenter, grid, time);
+            n0 = n1 = n2 = n3 = nRef;
+        }
+
+        // Emit two triangles: (0,1,2) and (0,2,3)
+        const float3 tri[6] = {v0, v1, v2, v0, v2, v3};
+        const float2 triUV[6] = {quadUVs[0], quadUVs[1], quadUVs[2], quadUVs[0], quadUVs[2], quadUVs[3]};
+        const float3 triN[6] = {n0, n1, n2, n0, n2, n3};
+
+        if (write + 5 >= grid.maxVertices) return;
+
+        #pragma unroll
+        for (int i = 0; i < 6; ++i) {
+            const float3 p = tri[i];
+            grid.d_vertices[write + i] = make_float4(p.x, p.y, p.z, 1.0f);
+
+            if (grid.d_vertexColors) {
+                grid.d_vertexColors[write + i] = make_float4(color_center.x, color_center.y, color_center.z, 1.0f);
+            }
+
+            if (grid.d_normals) {
+                const float3 n = triN[i];
+                grid.d_normals[write + i] = make_float4(n.x, n.y, n.z, 0.0f);
+            }
+
+            if (grid.d_primitiveIDs) {
+                *((float*)&grid.d_primitiveIDs[write + i]) = (float)dominantPrimID;
+            }
+
+            if (grid.d_uvCoords) {
+                grid.d_uvCoords[write + i] = triUV[i];
+            }
+
+            if (grid.d_indices) {
+                grid.d_indices[write + i] = write + i;
+            }
+        }
+
+        write += 6;
+    };
+
+    // X edge: corners 0-1, quad uses cells (x,y,z), (x,y-1,z), (x,y,z-1), (x,y-1,z-1)
+    if (((mask >> 1) & 1) != (unsigned char)s0) {
+        if (xyz.y > 0 && xyz.z > 0) {
+            int pA, pB, pC, pD;
+            if (lookupPackedCell(grid, xyz.x,     xyz.y,     xyz.z,     pA) &&
+                lookupPackedCell(grid, xyz.x,     xyz.y - 1, xyz.z,     pB) &&
+                lookupPackedCell(grid, xyz.x,     xyz.y,     xyz.z - 1, pC) &&
+                lookupPackedCell(grid, xyz.x,     xyz.y - 1, xyz.z - 1, pD)) {
+                emitQuadFromPackets(pA, pB, pD, pC); // ordering chosen for consistent winding (approx)
+            }
+        }
+    }
+
+    // Y edge: corners 0-3, quad uses cells (x,y,z), (x-1,y,z), (x,y,z-1), (x-1,y,z-1)
+    if (((mask >> 3) & 1) != (unsigned char)s0) {
+        if (xyz.x > 0 && xyz.z > 0) {
+            int pA, pB, pC, pD;
+            if (lookupPackedCell(grid, xyz.x,     xyz.y,     xyz.z,     pA) &&
+                lookupPackedCell(grid, xyz.x - 1, xyz.y,     xyz.z,     pB) &&
+                lookupPackedCell(grid, xyz.x,     xyz.y,     xyz.z - 1, pC) &&
+                lookupPackedCell(grid, xyz.x - 1, xyz.y,     xyz.z - 1, pD)) {
+                emitQuadFromPackets(pA, pC, pD, pB);
+            }
+        }
+    }
+
+    // Z edge: corners 0-4, quad uses cells (x,y,z), (x-1,y,z), (x,y-1,z), (x-1,y-1,z)
+    if (((mask >> 4) & 1) != (unsigned char)s0) {
+        if (xyz.x > 0 && xyz.y > 0) {
+            int pA, pB, pC, pD;
+            if (lookupPackedCell(grid, xyz.x,     xyz.y,     xyz.z,     pA) &&
+                lookupPackedCell(grid, xyz.x - 1, xyz.y,     xyz.z,     pB) &&
+                lookupPackedCell(grid, xyz.x,     xyz.y - 1, xyz.z,     pC) &&
+                lookupPackedCell(grid, xyz.x - 1, xyz.y - 1, xyz.z,     pD)) {
+                emitQuadFromPackets(pA, pB, pD, pC);
+            }
+        }
     }
 }

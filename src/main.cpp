@@ -60,6 +60,8 @@ bool g_useTextureArray = false; // DISABLE to test basic rendering
 bool g_textureArrayValid = false; // NEW: Track if texture array loaded successfully
 bool g_useVertexNormals = true; // NEW: Use precomputed vertex normals (better for displacements)
 uint32_t g_indexCount = 0; // Number of indices for indexed drawing
+MeshExtractionTechnique g_meshTechnique = MeshExtractionTechnique::MarchingCubes;
+float g_dcNormalSmoothAngleDeg = 30.0f;
 
 void checkGLErrors(const char* label) {
     GLenum err;
@@ -305,6 +307,22 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
         if (key == GLFW_KEY_SPACE) {  // NEW: Toggle animation
             g_AnimateMesh = !g_AnimateMesh;
             std::cout << "Animation: " << (g_AnimateMesh ? "ON" : "OFF") << std::endl;
+        }
+        if (key == GLFW_KEY_M) {  // Mesh extraction technique: Marching Cubes
+            g_meshTechnique = MeshExtractionTechnique::MarchingCubes;
+            std::cout << "Mesh technique: Marching Cubes" << std::endl;
+        }
+        if (key == GLFW_KEY_D) {  // Mesh extraction technique: Dual Contouring
+            g_meshTechnique = MeshExtractionTechnique::DualContouring;
+            std::cout << "Mesh technique: Dual Contouring" << std::endl;
+        }
+        if (key == GLFW_KEY_LEFT_BRACKET) { // DC normal smoothing angle down
+            g_dcNormalSmoothAngleDeg = std::max(0.0f, g_dcNormalSmoothAngleDeg - 5.0f);
+            std::cout << "DC normal smooth angle: " << g_dcNormalSmoothAngleDeg << " deg" << std::endl;
+        }
+        if (key == GLFW_KEY_RIGHT_BRACKET) { // DC normal smoothing angle up
+            g_dcNormalSmoothAngleDeg = std::min(89.0f, g_dcNormalSmoothAngleDeg + 5.0f);
+            std::cout << "DC normal smooth angle: " << g_dcNormalSmoothAngleDeg << " deg" << std::endl;
         }
         if (key == GLFW_KEY_ESCAPE) {
             glfwSetWindowShouldClose(window, true);
@@ -994,6 +1012,9 @@ int main() {
     std::cout << "T: Toggle texture array mode" << std::endl;
     std::cout << "N: Toggle vertex normals (ON=accurate for displacements, OFF=SDF gradient)" << std::endl;
     std::cout << "U: Unwrap mesh" << std::endl;
+    std::cout << "M: Marching Cubes" << std::endl;
+    std::cout << "D: Dual Contouring" << std::endl;
+    std::cout << "[]: Decrease/Increase DC normal smooth angle" << std::endl;
     std::cout << "A: CUDA atlas-pack existing UV charts (primitive UVs -> single atlas)" << std::endl;
     std::cout << "P: Perform projection baking" << std::endl;
     std::cout << "O: Export mesh to OBJ" << std::endl;
@@ -1082,7 +1103,7 @@ int main() {
             }
             
             // Update mesh with UV generation and normals
-            mesh.Update(time, d_vboPtr, d_cboPtr, d_iboPtr, d_uvPtr, d_primIDPtr, d_normalPtr);
+            mesh.Update(time, d_vboPtr, d_cboPtr, d_iboPtr, d_uvPtr, d_primIDPtr, d_normalPtr, g_meshTechnique, g_dcNormalSmoothAngleDeg);
             
             cudaGraphicsUnmapResources(1, &cudaVBO, 0);
             cudaGraphicsUnmapResources(1, &cudaCBO, 0);

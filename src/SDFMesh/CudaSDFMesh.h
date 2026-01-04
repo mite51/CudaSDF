@@ -3,6 +3,11 @@
 #include "CudaSDFUtil.h"
 #include <vector>
 
+enum class MeshExtractionTechnique : int {
+    MarchingCubes = 0,
+    DualContouring = 1
+};
+
 class CudaSDFMesh {
 public:
     CudaSDFMesh();
@@ -21,7 +26,9 @@ public:
     // d_outVertices, d_outColors, d_outIndices must be valid device pointers
     // d_outUVs, d_outPrimitiveIDs, and d_outNormals are optional (can be nullptr)
     void Update(float time, float4* d_outVertices, float4* d_outColors, unsigned int* d_outIndices,
-                float2* d_outUVs = nullptr, int* d_outPrimitiveIDs = nullptr, float4* d_outNormals = nullptr);
+                float2* d_outUVs = nullptr, int* d_outPrimitiveIDs = nullptr, float4* d_outNormals = nullptr,
+                MeshExtractionTechnique technique = MeshExtractionTechnique::MarchingCubes,
+                float dcNormalSmoothAngleDeg = 30.0f);
 
     // Getters for Renderer to update its buffers
     const std::vector<BVHNode>& GetBVHNodes() const { return m_bvhNodes; }
@@ -49,6 +56,8 @@ public:
 private:
     SDFGrid h_grid;
     SDFGrid d_grid;
+
+    int m_packedSize = 0; // estimatedActiveBlocks * SDF_BLOCK_SIZE_CUBED (matches allocations)
     
     // Temp storage for Scan
     void* d_temp_storage = nullptr;

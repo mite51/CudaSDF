@@ -144,6 +144,27 @@ struct SDFGrid {
     // Data for MC (Packed)
     unsigned int* d_packetVertexCounts; // Per-active-voxel vertex/triangle count
     unsigned int* d_packetVertexOffsets; // Scanned offsets
+
+    // --- Dual Contouring (packed, optional/lazy allocated) ---
+    // Mapping from global linear block index -> activeBlockId, or -1 if inactive.
+    int* d_blockToActiveId;
+
+    // Per packed-cell (activeBlockId * SDF_BLOCK_SIZE_CUBED + tid):
+    // - 8-bit corner sign mask (bit i corresponds to marchingCubeCorners[i])
+    unsigned char* d_dcCornerMasks;
+
+    // Scan result for "hasVertex" (0/1) counts: maps packed-cell -> compact DC cell-vertex index.
+    // This must persist across quad counting / generation, so it cannot reuse d_packetVertexOffsets.
+    unsigned int* d_dcCellVertexOffsets;
+
+    // Compact DC cell-vertex buffer (size = maxVertices entries). Stored as quantized offset within cell.
+    // Decode: p = cellMin + (ushort.xyz / 65535.0f) * cellSize.
+    ushort4* d_dcCellVertices;
+
+    // Compact DC cell-vertex normal buffer (size = maxVertices entries).
+    // Stored as signed normalized int16 in [-32767, 32767] for xyz.
+    short4* d_dcCellNormals;
+    short4* d_dcCellNormalsTmp;
     
     // Results
     float4* d_vertices; // Output vertices

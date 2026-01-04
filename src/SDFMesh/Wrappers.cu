@@ -9,6 +9,14 @@ extern __global__ void scoutActiveBlocks(SDFGrid grid, float time);
 extern __global__ void countActiveBlockTriangles(SDFGrid grid, float time);
 extern __global__ void generateActiveBlockTriangles(SDFGrid grid, float time);
 
+// Dual Contouring kernels (implemented in MarchingCubesKernels.cu for now)
+extern __global__ void buildBlockToActiveMap(SDFGrid grid);
+extern __global__ void dcMarkCells(SDFGrid grid, float time);
+extern __global__ void dcSolveCellVertices(SDFGrid grid, float time, unsigned int maxCellVertices);
+extern __global__ void dcSmoothCellNormals(SDFGrid grid, float cosAngleThreshold);
+extern __global__ void dcCountQuads(SDFGrid grid);
+extern __global__ void dcGenerateQuads(SDFGrid grid, float time);
+
 extern "C" void launchScoutActiveBlocks(SDFGrid& grid, float time) {
     unsigned int numBlocks = grid.blocksDim.x * grid.blocksDim.y * grid.blocksDim.z;
     int threads = 256;
@@ -26,6 +34,47 @@ extern "C" void launchGenerateActiveBlockTriangles(SDFGrid& grid, int numActiveB
     if (numActiveBlocks == 0) return;
     int threads = SDF_BLOCK_SIZE_CUBED; // 512 for 8^3
     generateActiveBlockTriangles<<<numActiveBlocks, threads>>>(grid, time);
+}
+
+// --------------------------------------------------------------------------
+// Dual Contouring wrappers
+// --------------------------------------------------------------------------
+
+extern "C" void launchBuildBlockToActiveMap(SDFGrid& grid, int numActiveBlocks) {
+    if (numActiveBlocks == 0) return;
+    int threads = 256;
+    int blocks = (numActiveBlocks + threads - 1) / threads;
+    buildBlockToActiveMap<<<blocks, threads>>>(grid);
+}
+
+extern "C" void launchDCMarkCells(SDFGrid& grid, int numActiveBlocks, float time) {
+    if (numActiveBlocks == 0) return;
+    int threads = SDF_BLOCK_SIZE_CUBED; // 512
+    dcMarkCells<<<numActiveBlocks, threads>>>(grid, time);
+}
+
+extern "C" void launchDCSolveCellVertices(SDFGrid& grid, int numActiveBlocks, float time, unsigned int maxCellVertices) {
+    if (numActiveBlocks == 0) return;
+    int threads = SDF_BLOCK_SIZE_CUBED; // 512
+    dcSolveCellVertices<<<numActiveBlocks, threads>>>(grid, time, maxCellVertices);
+}
+
+extern "C" void launchDCSmoothCellNormals(SDFGrid& grid, int numActiveBlocks, float cosAngleThreshold) {
+    if (numActiveBlocks == 0) return;
+    int threads = SDF_BLOCK_SIZE_CUBED; // 512
+    dcSmoothCellNormals<<<numActiveBlocks, threads>>>(grid, cosAngleThreshold);
+}
+
+extern "C" void launchDCCountQuads(SDFGrid& grid, int numActiveBlocks) {
+    if (numActiveBlocks == 0) return;
+    int threads = SDF_BLOCK_SIZE_CUBED; // 512
+    dcCountQuads<<<numActiveBlocks, threads>>>(grid);
+}
+
+extern "C" void launchDCGenerateQuads(SDFGrid& grid, int numActiveBlocks, float time) {
+    if (numActiveBlocks == 0) return;
+    int threads = SDF_BLOCK_SIZE_CUBED; // 512
+    dcGenerateQuads<<<numActiveBlocks, threads>>>(grid, time);
 }
 
 extern "C" void getScanStorageSize(unsigned int num_items, size_t* temp_storage_bytes) {
