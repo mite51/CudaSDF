@@ -52,6 +52,11 @@ bool g_triggerAtlasPack = false; // NEW: CUDA atlas packing trigger
 bool g_triggerProjection = false; // Flag to trigger projection baking
 bool g_triggerObjExport = false; // Flag to trigger OBJ export
 bool g_AnimateMesh = true; // Flag to control animation/update
+bool g_meshDirty = true;   // Force a mesh rebuild even when animation is paused
+bool g_rotateView = true; // NEW: Toggle camera/view rotation
+double g_cameraAngle = 0.0; // View orbit angle (advances with real dt when view rotation is ON)
+double g_simTime = 0.0;    // Simulation time (advances only when animation is ON)
+double g_lastFrameTime = 0.0;
 bool g_isUnwrapped = false; // Track if mesh has been unwrapped
 bool g_isAtlasPacked = false; // NEW: Track if UVs have been repacked into a single atlas (triangle soup)
 bool g_hasProjectedTexture = false; // Track if texture has been projection baked
@@ -68,6 +73,45 @@ void checkGLErrors(const char* label) {
     while ((err = glGetError()) != GL_NO_ERROR) {
         std::cerr << "OpenGL Error at " << label << ": " << err << std::endl;
     }
+}
+
+struct Vec3 {
+    float x, y, z;
+};
+
+static inline Vec3 vsub(const Vec3& a, const Vec3& b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+static inline float vdot(const Vec3& a, const Vec3& b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+static inline Vec3 vcross(const Vec3& a, const Vec3& b) {
+    return { a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x };
+}
+static inline Vec3 vnormalize(const Vec3& v) {
+    float len2 = v.x*v.x + v.y*v.y + v.z*v.z;
+    if (len2 <= 1e-20f) return {0,0,0};
+    float inv = 1.0f / sqrtf(len2);
+    return { v.x*inv, v.y*inv, v.z*inv };
+}
+
+// Column-major OpenGL view matrix (like gluLookAt)
+static inline void BuildLookAt(float out[16], const Vec3& eye, const Vec3& center, const Vec3& up) {
+    Vec3 f = vnormalize(vsub(center, eye));
+    Vec3 s = vnormalize(vcross(f, up));
+    Vec3 u = vcross(s, f);
+
+    out[0] = s.x;  out[4] = s.y;  out[8]  = s.z;  out[12] = -vdot(s, eye);
+    out[1] = u.x;  out[5] = u.y;  out[9]  = u.z;  out[13] = -vdot(u, eye);
+    out[2] = -f.x; out[6] = -f.y; out[10] = -f.z; out[14] = vdot(f, eye);
+    out[3] = 0.0f; out[7] = 0.0f; out[11] = 0.0f; out[15] = 1.0f;
+}
+
+static inline void ExtractCameraPosFromView(const float view[16], float outPos[3]) {
+    // For rigid view matrix V = [R t; 0 1], eye = -R^T * t
+    const float tx = view[12], ty = view[13], tz = view[14];
+    const float r00 = view[0], r01 = view[4], r02 = view[8];
+    const float r10 = view[1], r11 = view[5], r12 = view[9];
+    const float r20 = view[2], r21 = view[6], r22 = view[10];
+    outPos[0] = -(r00*tx + r10*ty + r20*tz);
+    outPos[1] = -(r01*tx + r11*ty + r21*tz);
+    outPos[2] = -(r02*tx + r12*ty + r22*tz);
 }
 
 // Load texture array with multiple textures (all must be same size)
@@ -276,6 +320,10 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
             wireframe = !wireframe;
             glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);
         }
+        if (key == GLFW_KEY_C) {  // NEW: Toggle view rotation
+            g_rotateView = !g_rotateView;
+            std::cout << "View rotation: " << (g_rotateView ? "ON" : "OFF") << std::endl;
+        }
         if (key == GLFW_KEY_U) {
             g_triggerUnwrap = true;
         }
@@ -296,6 +344,8 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
         if (key == GLFW_KEY_V) {  // NEW: Toggle UV generation
             g_enableUVGeneration = !g_enableUVGeneration;
             std::cout << "UV generation: " << (g_enableUVGeneration ? "ON" : "OFF") << std::endl;
+            // UV generation affects mesh output buffers
+            g_meshDirty = true;
         }
         if (key == GLFW_KEY_N) {  // NEW: Toggle vertex normals
             g_useVertexNormals = !g_useVertexNormals;
@@ -311,18 +361,22 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
         if (key == GLFW_KEY_M) {  // Mesh extraction technique: Marching Cubes
             g_meshTechnique = MeshExtractionTechnique::MarchingCubes;
             std::cout << "Mesh technique: Marching Cubes" << std::endl;
+            g_meshDirty = true;
         }
         if (key == GLFW_KEY_D) {  // Mesh extraction technique: Dual Contouring
             g_meshTechnique = MeshExtractionTechnique::DualContouring;
             std::cout << "Mesh technique: Dual Contouring" << std::endl;
+            g_meshDirty = true;
         }
         if (key == GLFW_KEY_LEFT_BRACKET) { // DC normal smoothing angle down
             g_dcNormalSmoothAngleDeg = std::max(0.0f, g_dcNormalSmoothAngleDeg - 5.0f);
             std::cout << "DC normal smooth angle: " << g_dcNormalSmoothAngleDeg << " deg" << std::endl;
+            g_meshDirty = true;
         }
         if (key == GLFW_KEY_RIGHT_BRACKET) { // DC normal smoothing angle up
             g_dcNormalSmoothAngleDeg = std::min(89.0f, g_dcNormalSmoothAngleDeg + 5.0f);
             std::cout << "DC normal smooth angle: " << g_dcNormalSmoothAngleDeg << " deg" << std::endl;
+            g_meshDirty = true;
         }
         if (key == GLFW_KEY_ESCAPE) {
             glfwSetWindowShouldClose(window, true);
@@ -673,9 +727,8 @@ void PerformProjectionBaking(const float* model, const float* view, const float*
     std::cout << "Starting projection baking to " << textureSize << "x" << textureSize << " texture..." << std::endl;
     
     // Calculate camera position from view matrix
-    // View matrix is inverse of camera transform, so we need to extract camera position
-    // For a view matrix that translates by (0, 0, -3), camera is at (0, 0, 3)
-    float cameraPos[3] = {0.0f, 0.0f, 3.0f}; // This matches the view matrix in main
+    float cameraPos[3] = {0.0f, 0.0f, 3.0f};
+    ExtractCameraPosFromView(view, cameraPos);
     
     // Create baked texture if not exists
     if (g_bakedTextureID == 0) {
@@ -987,6 +1040,8 @@ int main() {
         0,0,1,0, 
         0,0,-3,1 
     };
+    float baseView[16];
+    memcpy(baseView, view, sizeof(view));
 
     // Standard Perspective Projection
     float fov = 45.0f * (3.14159f / 180.0f);
@@ -1008,6 +1063,7 @@ int main() {
     // Print controls to console
     std::cout << "\n=== CONTROLS ===" << std::endl;
     std::cout << "W: Toggle wireframe" << std::endl;
+    std::cout << "C: Toggle view rotation" << std::endl;
     std::cout << "V: Toggle UV generation" << std::endl;
     std::cout << "T: Toggle texture array mode" << std::endl;
     std::cout << "N: Toggle vertex normals (ON=accurate for displacements, OFF=SDF gradient)" << std::endl;
@@ -1024,6 +1080,7 @@ int main() {
 
     double lastFPSTime = glfwGetTime();
     int frameCount = 0;
+    g_lastFrameTime = lastFPSTime;
 
     while (!glfwWindowShouldClose(window)) {
         double currentTime = glfwGetTime();
@@ -1035,15 +1092,40 @@ int main() {
             lastFPSTime = currentTime;
         }
 
-        float time = (float)currentTime;
-        
-        // Animate Primitives
+        // Advance simulation time only when animation is enabled.
+        double dt = currentTime - g_lastFrameTime;
+        g_lastFrameTime = currentTime;
+        if (dt < 0.0) dt = 0.0;
+        if (dt > 0.25) dt = 0.25; // clamp huge hitches (breakpoints, window drag, etc.)
         if (g_AnimateMesh) {
-            scenePrimitives[0].dispParams[1] = 5.0f * sin(time*0.1f);
-            float c_rot = cos(time), s_rot = sin(time);
-            scenePrimitives[1].rotation = make_float4(0.0f, s_rot, 0.0f, c_rot);
-            scenePrimitives[2].position.y = -0.5f + 0.2f * sin(time * 2.0f);
-            scenePrimitives[3].params[2] = 0.1f + 0.05f * sin(time * 3.0f);
+            g_simTime += dt;
+        }
+        float simTime = (float)g_simTime;
+        
+        // Rotate camera/view (doesn't require mesh rebuild)
+        if (g_rotateView) 
+        {
+            g_cameraAngle -= dt * 1.5;
+            // keep angle bounded to avoid precision issues over long runs
+            if (g_cameraAngle > 100000.0) g_cameraAngle = fmod(g_cameraAngle, 6.283185307179586);
+        }
+        float angle = (float)g_cameraAngle;
+        Vec3 eye = {sinf(angle) * 3.0f, 0.0f, cosf(angle) * 3.0f};
+        BuildLookAt(view, eye, {0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f});
+
+        // Update mesh if animating OR if something toggled that requires a rebuild.
+        // NOTE: If the mesh has been unwrapped or atlas-packed, we treat it as "locked" and do not overwrite buffers.
+        const bool meshLocked = (g_isUnwrapped || g_isAtlasPacked);
+        const bool shouldUpdateMesh = (!meshLocked) && (g_AnimateMesh || g_meshDirty);
+        if (shouldUpdateMesh) {
+            if (g_AnimateMesh) {
+                // Animate primitives only when animation is enabled
+                scenePrimitives[0].dispParams[1] = 5.0f * sinf(simTime*0.1f);
+                float c_rot = cosf(simTime), s_rot = sinf(simTime);
+                scenePrimitives[1].rotation = make_float4(0.0f, s_rot, 0.0f, c_rot);
+                scenePrimitives[2].position.y = -0.5f + 0.2f * sinf(simTime * 2.0f);
+                scenePrimitives[3].params[2] = 0.1f + 0.05f * sinf(simTime * 3.0f);
+            }
 
             // Update Mesh
             mesh.ClearPrimitives();
@@ -1103,7 +1185,7 @@ int main() {
             }
             
             // Update mesh with UV generation and normals
-            mesh.Update(time, d_vboPtr, d_cboPtr, d_iboPtr, d_uvPtr, d_primIDPtr, d_normalPtr, g_meshTechnique, g_dcNormalSmoothAngleDeg);
+            mesh.Update(simTime, d_vboPtr, d_cboPtr, d_iboPtr, d_uvPtr, d_primIDPtr, d_normalPtr, g_meshTechnique, g_dcNormalSmoothAngleDeg);
             
             cudaGraphicsUnmapResources(1, &cudaVBO, 0);
             cudaGraphicsUnmapResources(1, &cudaCBO, 0);
@@ -1114,6 +1196,8 @@ int main() {
                 cudaGraphicsUnmapResources(1, &cudaPrimIDBO, 0);
             }
             // cudaGraphicsUnmapResources(1, &cudaIBO, 0);
+
+            g_meshDirty = false;
         }
 
         // --- UV Unwrap Trigger ---
@@ -1140,6 +1224,7 @@ int main() {
                 
                 // After unwrap, stop updating the mesh so we can see the result
                 g_AnimateMesh = false;
+                g_meshDirty = false;
             } else {
                 std::cout << "Mesh is empty, cannot unwrap." << std::endl;
                 cudaGraphicsUnmapResources(1, &cudaVBO, 0);
@@ -1194,6 +1279,7 @@ int main() {
                         g_isAtlasPacked = true;
                         g_useTextureArray = false; // atlas mode uses a single texture
                         g_AnimateMesh = false;     // freeze mesh so packed UVs remain stable for projection tests
+                        g_meshDirty = false;
                         std::cout << "Atlas packing complete. UVs remapped into [0,1] atlas." << std::endl;
                     } else {
                         std::cout << "Atlas packing failed (partial/empty result). Try increasing gridSize or reducing margin/attempts." << std::endl;
@@ -1273,7 +1359,7 @@ int main() {
         }
         
         // Set time
-        glUniform1f(glGetUniformLocation(shaderProgram, "time"), time);
+        glUniform1f(glGetUniformLocation(shaderProgram, "time"), simTime);
         glUniform1i(glGetUniformLocation(shaderProgram, "uNumBVHPrimitives"), mesh.GetNumBVHPrimitives());
         glUniform1i(glGetUniformLocation(shaderProgram, "uNumTotalPrimitives"), (int)currentGPUPrimitives.size());
         glUniform1i(glGetUniformLocation(shaderProgram, "useVertexNormals"), g_useVertexNormals ? 1 : 0);
@@ -1281,12 +1367,7 @@ int main() {
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_BUFFER, texBVH);
         glUniform1i(glGetUniformLocation(shaderProgram, "bvhNodes"), 0);
-        
-        // Set matrices
-        float c = cos(time), s = sin(time);
-        model[0] = c; model[2] = -s;
-        model[8] = s; model[10] = c;
-        
+    
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, model);
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, view);
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, projection);
