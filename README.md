@@ -1,6 +1,6 @@
 # CudaSDF
 
-This project implements a Marching Cubes algorithm using CUDA and OpenGL for visualization, based on the NVIDIA PhysX implementation.
+This project implements a Marching Cubes algorithm using CUDA and OpenGL for visualization.
 
 ## Prerequisites
 
@@ -57,8 +57,24 @@ The implementation follows a standard GPU Marching Cubes pipeline:
 
 ## Controls
 
-*   The application renders an animated sphere.
-*   Close the window to exit.
+- **W**: Toggle wireframe rendering
+- **Space**: Toggle mesh animation
+- **C**: Toggle view rotation
+- **M**: Switch mesh extraction to **Marching Cubes**
+- **D**: Switch mesh extraction to **Dual Contouring**
+- **[ / ]**: Decrease / increase Dual Contouring normal smoothing angle
+- **B**: Toggle Dual Contouring normal mode (combined vs dominant primitive gradient)
+- **J**: Cycle Dual Contouring vertex projection iterations (0–9)
+- **K**: Toggle Dual Contouring refinement normal mode
+- **L**: Toggle Dual Contouring adaptive quad diagonal selection
+- **V**: Toggle UV generation
+- **U**: Trigger UV unwrap
+- **A**: Trigger UV atlas packing
+- **P**: Trigger texture projection
+- **T**: Toggle texture array mode
+- **N**: Toggle vertex normals mode (accurate vs SDF gradient)
+- **O**: Export mesh to OBJ
+- **Esc**: Exit
 
 
 <video src="https://raw.githubusercontent.com/mite51/CudaSDF/refs/heads/main/docs/demo.mp4" width="640" height="480" controls></video>
