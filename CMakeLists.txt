@@ -56,6 +56,7 @@ include_directories(src)
 
 set(SOURCES
     src/main.cpp
+    src/Camera.cpp
     src/SDFMesh/CudaSDFMesh.cpp
     src/SDFMesh/MarchingCubesKernels.cu
     src/SDFMesh/GridUVPacker.cu

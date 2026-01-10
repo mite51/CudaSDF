@@ -18,6 +18,7 @@
 #include "uv_unwrap_harmonic_parameterization/common/mesh.h"
 
 #include "SDFMesh/TextureLoader.h"
+#include "Camera.h"
 
 // Global variables
 const float GRID_SIZE = 64.0f; 
@@ -67,6 +68,12 @@ bool g_useVertexNormals = true; // NEW: Use precomputed vertex normals (better f
 uint32_t g_indexCount = 0; // Number of indices for indexed drawing
 MeshExtractionTechnique g_meshTechnique = MeshExtractionTechnique::MarchingCubes;
 float g_dcNormalSmoothAngleDeg = 30.0f;
+
+// Camera
+Camera g_camera;
+double g_lastMouseX = 0.0;
+double g_lastMouseY = 0.0;
+bool g_mouseInitialized = false;
 
 void checkGLErrors(const char* label) {
     GLenum err;
@@ -313,22 +320,65 @@ void checkProgramErrors(GLuint program, std::string type) {
     }
 }
 
+void mouse_callback(GLFWwindow* window, double xpos, double ypos) {
+    if (!g_mouseInitialized) {
+        g_lastMouseX = xpos;
+        g_lastMouseY = ypos;
+        g_mouseInitialized = true;
+        return;
+    }
+    
+    double xOffset = xpos - g_lastMouseX;
+    double yOffset = ypos - g_lastMouseY;
+    g_lastMouseX = xpos;
+    g_lastMouseY = ypos;
+    
+    // Only rotate when Alt is held and in free camera mode
+    if (g_camera.IsFreeCameraMode() &&
+        (glfwGetKey(window, GLFW_KEY_LEFT_ALT) == GLFW_PRESS ||
+         glfwGetKey(window, GLFW_KEY_RIGHT_ALT) == GLFW_PRESS)) {
+        g_camera.ProcessMouseMovement((float)xOffset, (float)yOffset);
+    }
+}
+
 void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods) {
     if (action == GLFW_PRESS) {
-        if (key == GLFW_KEY_W) {
+        bool freeMode = g_camera.IsFreeCameraMode();
+
+        if (key == GLFW_KEY_Q) {  // Changed from W to Q for wireframe toggle
             static bool wireframe = false;
             wireframe = !wireframe;
             glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);
         }
-        if (key == GLFW_KEY_C) {  // NEW: Toggle view rotation
-            g_rotateView = !g_rotateView;
-            std::cout << "View rotation: " << (g_rotateView ? "ON" : "OFF") << std::endl;
+        if (key == GLFW_KEY_C) {  // Toggle view rotation (orbit mode only)
+            if (!freeMode) {
+                g_rotateView = !g_rotateView;
+                std::cout << "View rotation: " << (g_rotateView ? "ON" : "OFF") << std::endl;
+            }
+        }
+        if (key == GLFW_KEY_F) {  // Toggle free camera mode
+            g_camera.SetFreeCameraMode(!freeMode);
+            if (freeMode) {
+                g_rotateView = false;  // Disable orbit when entering free camera
+                std::cout << "Free camera mode: ON (WASD to move, Alt+Mouse to look, Shift=fast, +/-=speed)" << std::endl;
+            } else {
+                std::cout << "Free camera mode: OFF (orbit mode)" << std::endl;
+            }
+        }
+        if (key == GLFW_KEY_EQUAL || key == GLFW_KEY_KP_ADD) {  // + key
+            g_camera.AdjustSpeed(0.5f);
+        }
+        if (key == GLFW_KEY_MINUS || key == GLFW_KEY_KP_SUBTRACT) {  // - key
+            g_camera.AdjustSpeed(-0.5f);
         }
         if (key == GLFW_KEY_U) {
             g_triggerUnwrap = true;
         }
         if (key == GLFW_KEY_A) {
-            g_triggerAtlasPack = true;
+            if(!freeMode)
+            {
+                g_triggerAtlasPack = true;
+            }
         }
         if (key == GLFW_KEY_P) {
             g_triggerProjection = true;
@@ -363,7 +413,7 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
             std::cout << "Mesh technique: Marching Cubes" << std::endl;
             g_meshDirty = true;
         }
-        if (key == GLFW_KEY_D) {  // Mesh extraction technique: Dual Contouring
+        if (key == GLFW_KEY_X) {  // Mesh extraction technique: Dual Contouring
             g_meshTechnique = MeshExtractionTechnique::DualContouring;
             std::cout << "Mesh technique: Dual Contouring" << std::endl;
             g_meshDirty = true;
@@ -399,6 +449,7 @@ void initGL() {
     glfwMakeContextCurrent(window);
     glfwSwapInterval(0); // Disable VSync
     glfwSetKeyCallback(window, key_callback);
+    glfwSetCursorPosCallback(window, mouse_callback);
 
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
         std::cout << "Failed to initialize GLAD" << std::endl;
@@ -941,6 +992,10 @@ int main() {
     // UV generation is controlled by passing non-null pointers to Update()
     g_enableUVGeneration = true;  // Enable flag
     
+    // Initialize camera at orbit position
+    g_camera.Initialize(0.0f, 0.0f, 3.0f);
+    g_camera.SetSpeed(2.0f);
+    
     GLFWwindow* window = glfwGetCurrentContext();
 
     // Create Scene (Primitives Showcase)
@@ -1062,18 +1117,28 @@ int main() {
 
     // Print controls to console
     std::cout << "\n=== CONTROLS ===" << std::endl;
-    std::cout << "W: Toggle wireframe" << std::endl;
-    std::cout << "C: Toggle view rotation" << std::endl;
+    std::cout << "--- Camera ---" << std::endl;
+    std::cout << "F: Toggle free camera mode (WASD + Alt+Mouse)" << std::endl;
+    std::cout << "WASD: Move camera (free mode only)" << std::endl;
+    std::cout << "Alt+Mouse: Rotate camera (free mode only)" << std::endl;
+    std::cout << "Shift: Move faster (free mode only)" << std::endl;
+    std::cout << "+/-: Adjust movement speed" << std::endl;
+    std::cout << "C: Toggle view rotation (orbit mode only)" << std::endl;
+    std::cout << "--- Rendering ---" << std::endl;
+    std::cout << "Q: Toggle wireframe" << std::endl;
     std::cout << "V: Toggle UV generation" << std::endl;
     std::cout << "T: Toggle texture array mode" << std::endl;
     std::cout << "N: Toggle vertex normals (ON=accurate for displacements, OFF=SDF gradient)" << std::endl;
-    std::cout << "U: Unwrap mesh" << std::endl;
+    std::cout << "--- Mesh ---" << std::endl;
     std::cout << "M: Marching Cubes" << std::endl;
-    std::cout << "D: Dual Contouring" << std::endl;
+    std::cout << "X: Dual Contouring" << std::endl;
     std::cout << "[]: Decrease/Increase DC normal smooth angle" << std::endl;
+    std::cout << "--- UV/Export ---" << std::endl;
+    std::cout << "U: Unwrap mesh" << std::endl;
     std::cout << "A: CUDA atlas-pack existing UV charts (primitive UVs -> single atlas)" << std::endl;
     std::cout << "P: Perform projection baking" << std::endl;
     std::cout << "O: Export mesh to OBJ" << std::endl;
+    std::cout << "--- Other ---" << std::endl;
     std::cout << "SPACE: Toggle animation" << std::endl;
     std::cout << "ESC: Exit" << std::endl;
     std::cout << "================\n" << std::endl;
@@ -1102,19 +1167,25 @@ int main() {
         }
         float simTime = (float)g_simTime;
         
-        // Rotate camera/view (doesn't require mesh rebuild)
-        if (g_rotateView) 
-        {
-            g_cameraAngle -= dt * 1.5;
-            // keep angle bounded to avoid precision issues over long runs
-            if (g_cameraAngle > 100000.0) g_cameraAngle = fmod(g_cameraAngle, 6.283185307179586);
+        // Camera update
+        if (g_camera.IsFreeCameraMode()) {
+            // Free camera mode - process WASD movement
+            g_camera.ProcessKeyboard(window, (float)dt);
+            g_camera.GetViewMatrix(view);
+        } else {
+            // Orbit mode - rotate camera around origin
+            if (g_rotateView) {
+                g_cameraAngle -= dt * 1.5;
+                // keep angle bounded to avoid precision issues over long runs
+                if (g_cameraAngle > 100000.0) g_cameraAngle = fmod(g_cameraAngle, 6.283185307179586);
+            }
+            float angle = (float)g_cameraAngle;
+            Vec3 eye = {sinf(angle) * 3.0f, 0.0f, cosf(angle) * 3.0f};
+            BuildLookAt(view, eye, {0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f});
         }
-        float angle = (float)g_cameraAngle;
-        Vec3 eye = {sinf(angle) * 3.0f, 0.0f, cosf(angle) * 3.0f};
-        BuildLookAt(view, eye, {0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f});
 
         // Update mesh if animating OR if something toggled that requires a rebuild.
-        // NOTE: If the mesh has been unwrapped or atlas-packed, we treat it as "locked" and do not overwrite buffers.
+        // NOTEF: If the mesh has been unwrapped or atlas-packed, we treat it as "locked" and do not overwrite buffers.
         const bool meshLocked = (g_isUnwrapped || g_isAtlasPacked);
         const bool shouldUpdateMesh = (!meshLocked) && (g_AnimateMesh || g_meshDirty);
         if (shouldUpdateMesh) {
