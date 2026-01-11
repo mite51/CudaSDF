@@ -24,6 +24,7 @@
 
 #include "SDFMesh/TextureLoader.h"
 #include "Camera.h"
+#include "DebugDraw.h"
 
 // Global variables
 float g_gridSize = 32.0f;  // Mutable grid size (adjustable in UI)
@@ -82,6 +83,10 @@ Camera g_camera;
 double g_lastMouseX = 0.0;
 double g_lastMouseY = 0.0;
 bool g_mouseInitialized = false;
+
+// Debug Drawing
+DebugDraw g_debugDrawInstance;
+bool g_showBoundingBox = false;
 
 void checkGLErrors(const char* label) {
     GLenum err;
@@ -435,6 +440,10 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
             std::cout << "DC normal smooth angle: " << g_dcNormalSmoothAngleDeg << " deg" << std::endl;
             g_meshDirty = true;
         }
+        if (key == GLFW_KEY_B) {  // Toggle bounding box display
+            g_showBoundingBox = !g_showBoundingBox;
+            std::cout << "Bounding box: " << (g_showBoundingBox ? "ON" : "OFF") << std::endl;
+        }
         if (key == GLFW_KEY_ESCAPE) {
             glfwSetWindowShouldClose(window, true);
         }
@@ -711,6 +720,12 @@ void initGL() {
     ImGui_ImplOpenGL3_Init("#version 330");
     
     std::cout << "ImGui initialized successfully" << std::endl;
+    
+    // Initialize Debug Drawing
+    g_debugDraw = &g_debugDrawInstance;
+    if (!g_debugDraw->Initialize()) {
+        std::cerr << "Failed to initialize debug draw system!" << std::endl;
+    }
 }
 
 // Helpers for unwrap
@@ -904,6 +919,10 @@ void RenderUI() {
     if (ImGui::CollapsingHeader("Rendering", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (ImGui::Checkbox("Wireframe", &g_wireframeMode)) {
             glPolygonMode(GL_FRONT_AND_BACK, g_wireframeMode ? GL_LINE : GL_FILL);
+        }
+        
+        if (ImGui::Checkbox("Show Bounding Box (B)", &g_showBoundingBox)) {
+            std::cout << "Bounding box: " << (g_showBoundingBox ? "ON" : "OFF") << std::endl;
         }
         
         if (ImGui::Checkbox("UV Generation", &g_enableUVGeneration)) {
@@ -1753,6 +1772,25 @@ int main() {
             glDrawArrays(GL_TRIANGLES, 0, mesh.GetTotalVertexCount());
         }
         
+        // Debug Draw - Bounding Box
+        if (g_showBoundingBox && g_debugDraw) {
+            float3 boundsMin, boundsMax;
+            mesh.GetBounds(boundsMin, boundsMax);
+            
+            // Draw bounding box with cyan color
+            g_debugDraw->AddBox(
+                boundsMin.x, boundsMin.y, boundsMin.z,
+                boundsMax.x, boundsMax.y, boundsMax.z,
+                0.0f, 1.0f, 1.0f, 1.0f,  // Cyan color
+                0.005f  // Line width
+            );
+            
+            // Add axes at origin for reference
+            g_debugDraw->AddAxes(0.0f, 0.0f, 0.0f, 0.2f, 0.008f);
+            
+            g_debugDraw->Render(view, projection);
+        }
+        
         // Render ImGui
         RenderUI();
         ImGui::Render();
@@ -1762,6 +1800,12 @@ int main() {
         glfwPollEvents();
     }
 
+    // Cleanup DebugDraw
+    if (g_debugDraw) {
+        g_debugDraw->Shutdown();
+        g_debugDraw = nullptr;
+    }
+    
     // Cleanup ImGui
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();

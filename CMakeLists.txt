@@ -58,6 +58,7 @@ include_directories(src/imgui)  # For ImGui backends to find imgui.h
 set(SOURCES
     src/main.cpp
     src/Camera.cpp
+    src/DebugDraw.cpp
     src/SDFMesh/CudaSDFMesh.cpp
     src/SDFMesh/MarchingCubesKernels.cu
     src/SDFMesh/GridUVPacker.cu

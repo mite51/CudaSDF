@@ -54,6 +54,16 @@ public:
     
     MemStats GetMemoryStats() const;
 
+    // Get mesh bounds (for debug visualization)
+    void GetBounds(float3& outMin, float3& outMax) const {
+        outMin = h_grid.origin;
+        outMax = make_float3(
+            h_grid.origin.x + h_grid.width * h_grid.cellSize,
+            h_grid.origin.y + h_grid.height * h_grid.cellSize,
+            h_grid.origin.z + h_grid.depth * h_grid.cellSize
+        );
+    }
+
 private:
     SDFGrid h_grid;
     SDFGrid d_grid;
