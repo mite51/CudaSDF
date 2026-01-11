@@ -53,6 +53,7 @@ file(COPY ${CMAKE_SOURCE_DIR}/assets/test_pattern.jpg DESTINATION ${CMAKE_BINARY
 find_package(OpenGL REQUIRED)
 
 include_directories(src)
+include_directories(src/imgui)  # For ImGui backends to find imgui.h
 
 set(SOURCES
     src/main.cpp
@@ -70,6 +71,13 @@ set(SOURCES
     src/uv_unwrap_harmonic_parameterization/unwrap/seam_splitter.cpp
     src/uv_unwrap_harmonic_parameterization/unwrap/unwrap_pipeline.cpp
     src/uv_unwrap_harmonic_parameterization/unwrap/uv_validation.cpp
+    # ImGui
+    src/imgui/imgui.cpp
+    src/imgui/imgui_draw.cpp
+    src/imgui/imgui_tables.cpp
+    src/imgui/imgui_widgets.cpp
+    src/imgui/backends/imgui_impl_glfw.cpp
+    src/imgui/backends/imgui_impl_opengl3.cpp
 )
 
 add_executable(CudaSDF ${SOURCES})

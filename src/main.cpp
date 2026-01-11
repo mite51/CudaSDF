@@ -9,6 +9,11 @@
 #include <map>
 #include <fstream>
 
+// ImGui
+#include "imgui/imgui.h"
+#include "imgui/backends/imgui_impl_glfw.h"
+#include "imgui/backends/imgui_impl_opengl3.h"
+
 #include "SDFMesh/Commons.cuh"
 #include "SDFMesh/CudaSDFMesh.h"
 #include "SDFMesh/CudaSDFUtil.h" 
@@ -21,8 +26,8 @@
 #include "Camera.h"
 
 // Global variables
-const float GRID_SIZE = 64.0f; 
-const float CELL_SIZE = 1.0f/GRID_SIZE;
+float g_gridSize = 32.0f;  // Mutable grid size (adjustable in UI)
+float g_cellSize = 1.0f / g_gridSize;  // Computed from grid size
 const unsigned int WINDOW_WIDTH = 1024;
 const unsigned int WINDOW_HEIGHT = 768;
 
@@ -68,6 +73,9 @@ bool g_useVertexNormals = true; // NEW: Use precomputed vertex normals (better f
 uint32_t g_indexCount = 0; // Number of indices for indexed drawing
 MeshExtractionTechnique g_meshTechnique = MeshExtractionTechnique::MarchingCubes;
 float g_dcNormalSmoothAngleDeg = 30.0f;
+float g_dcQefBlend = 1.0f; // QEF blend: 0 = blocky (cell center), 1 = full QEF solve
+bool g_wireframeMode = false; // Wireframe rendering toggle
+bool g_triggerGridRebuild = false; // Trigger to rebuild grid with new size
 
 // Camera
 Camera g_camera;
@@ -346,9 +354,8 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
         bool freeMode = g_camera.IsFreeCameraMode();
 
         if (key == GLFW_KEY_Q) {  // Changed from W to Q for wireframe toggle
-            static bool wireframe = false;
-            wireframe = !wireframe;
-            glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);
+            g_wireframeMode = !g_wireframeMode;
+            glPolygonMode(GL_FRONT_AND_BACK, g_wireframeMode ? GL_LINE : GL_FILL);
         }
         if (key == GLFW_KEY_C) {  // Toggle view rotation (orbit mode only)
             if (!freeMode) {
@@ -673,6 +680,37 @@ void initGL() {
     }
     
     checkGLErrors("initGL");
+    
+    // Initialize ImGui
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    
+    // Setup ImGui style - dark theme with custom accent
+    ImGui::StyleColorsDark();
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.WindowRounding = 6.0f;
+    style.FrameRounding = 4.0f;
+    style.GrabRounding = 4.0f;
+    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.08f, 0.08f, 0.12f, 0.94f);
+    style.Colors[ImGuiCol_Header] = ImVec4(0.26f, 0.59f, 0.98f, 0.31f);
+    style.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.26f, 0.59f, 0.98f, 0.80f);
+    style.Colors[ImGuiCol_HeaderActive] = ImVec4(0.26f, 0.59f, 0.98f, 1.00f);
+    style.Colors[ImGuiCol_Button] = ImVec4(0.20f, 0.25f, 0.35f, 1.00f);
+    style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.30f, 0.45f, 0.65f, 1.00f);
+    style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.26f, 0.59f, 0.98f, 1.00f);
+    style.Colors[ImGuiCol_FrameBg] = ImVec4(0.16f, 0.18f, 0.22f, 1.00f);
+    style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.22f, 0.26f, 0.32f, 1.00f);
+    style.Colors[ImGuiCol_SliderGrab] = ImVec4(0.26f, 0.59f, 0.98f, 0.78f);
+    style.Colors[ImGuiCol_SliderGrabActive] = ImVec4(0.46f, 0.69f, 1.00f, 1.00f);
+    style.Colors[ImGuiCol_CheckMark] = ImVec4(0.26f, 0.98f, 0.59f, 1.00f);
+    
+    // Setup Platform/Renderer backends
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 330");
+    
+    std::cout << "ImGui initialized successfully" << std::endl;
 }
 
 // Helpers for unwrap
@@ -855,6 +893,222 @@ void PerformProjectionBaking(const float* model, const float* view, const float*
     checkGLErrors("PerformProjectionBaking");
 }
 
+// ImGui Control Panel
+void RenderUI() {
+    ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(280, 0), ImGuiCond_FirstUseEver);
+    
+    ImGui::Begin("Controls", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+    
+    // --- Rendering Section ---
+    if (ImGui::CollapsingHeader("Rendering", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::Checkbox("Wireframe", &g_wireframeMode)) {
+            glPolygonMode(GL_FRONT_AND_BACK, g_wireframeMode ? GL_LINE : GL_FILL);
+        }
+        
+        if (ImGui::Checkbox("UV Generation", &g_enableUVGeneration)) {
+            std::cout << "UV generation: " << (g_enableUVGeneration ? "ON" : "OFF") << std::endl;
+            g_meshDirty = true;
+        }
+        
+        bool canUseTextureArray = g_textureArrayValid && !g_isUnwrapped && !g_isAtlasPacked;
+        if (!canUseTextureArray) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Checkbox("Texture Array Mode", &g_useTextureArray)) {
+            if (g_useTextureArray && !g_textureArrayValid) {
+                std::cout << "Texture array mode: ON (but no textures loaded)" << std::endl;
+            } else {
+                std::cout << "Texture array mode: " << (g_useTextureArray ? "ON" : "OFF") << std::endl;
+            }
+        }
+        if (!canUseTextureArray) {
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip("Requires valid texture array and no unwrap/atlas");
+            }
+        }
+        
+        if (ImGui::Checkbox("Vertex Normals", &g_useVertexNormals)) {
+            std::cout << "Vertex normals: " << (g_useVertexNormals ? "ON (accurate)" : "OFF (SDF gradient)") << std::endl;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("ON = accurate for displacements\nOFF = SDF gradient");
+        }
+    }
+    
+    // --- Mesh Extraction Section ---
+    if (ImGui::CollapsingHeader("Mesh Extraction", ImGuiTreeNodeFlags_DefaultOpen)) {
+        /* Disabled until changing grid size is implemented
+        // Grid Size
+        ImGui::SetNextItemWidth(120);
+        int gridSizeInt = (int)g_gridSize;
+        if (ImGui::SliderInt("Grid Size", &gridSizeInt, 8, 128)) {
+            g_gridSize = (float)gridSizeInt;
+            g_cellSize = 1.0f / g_gridSize;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Rebuild")) {
+            g_triggerGridRebuild = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Rebuild mesh with new grid size");
+        }
+        
+        ImGui::Separator();
+        */
+        
+        bool isMC = (g_meshTechnique == MeshExtractionTechnique::MarchingCubes);
+        bool isDC = (g_meshTechnique == MeshExtractionTechnique::DualContouring);
+        
+        if (ImGui::RadioButton("Marching Cubes", isMC)) {
+            g_meshTechnique = MeshExtractionTechnique::MarchingCubes;
+            std::cout << "Mesh technique: Marching Cubes" << std::endl;
+            g_meshDirty = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Dual Contouring", isDC)) {
+            g_meshTechnique = MeshExtractionTechnique::DualContouring;
+            std::cout << "Mesh technique: Dual Contouring" << std::endl;
+            g_meshDirty = true;
+        }
+        
+        if (isDC) {
+            ImGui::SetNextItemWidth(150);
+            if (ImGui::SliderFloat("Normal Smooth Angle", &g_dcNormalSmoothAngleDeg, 0.0f, 89.0f, "%.0f deg")) {
+                std::cout << "DC normal smooth angle: " << g_dcNormalSmoothAngleDeg << " deg" << std::endl;
+                g_meshDirty = true;
+            }
+            
+            ImGui::SetNextItemWidth(150);
+            if (ImGui::SliderFloat("QEF Blend", &g_dcQefBlend, 0.0f, 1.0f, "%.2f")) {
+                g_meshDirty = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("0 = Blocky (cell center)\n1 = Full QEF solve\nBlends vertex positions");
+            }
+        }
+    }
+    
+    // --- UV / Export Section ---
+    if (ImGui::CollapsingHeader("UV / Export", ImGuiTreeNodeFlags_DefaultOpen)) {
+        bool meshLocked = g_isUnwrapped || g_isAtlasPacked;
+        
+        if (meshLocked) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Button("Unwrap Mesh (U)", ImVec2(-1, 0))) {
+            g_triggerUnwrap = true;
+        }
+        if (meshLocked) {
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip("Mesh already unwrapped or atlas-packed");
+            }
+        }
+        
+        bool canAtlasPack = g_enableUVGeneration && !meshLocked;
+        if (!canAtlasPack) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Button("CUDA Atlas Pack (A)", ImVec2(-1, 0))) {
+            g_triggerAtlasPack = true;
+        }
+        if (!canAtlasPack) {
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip("Requires UV generation enabled");
+            }
+        }
+        
+        bool canProject = g_isUnwrapped || g_isAtlasPacked;
+        if (!canProject) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Button("Projection Baking (P)", ImVec2(-1, 0))) {
+            g_triggerProjection = true;
+        }
+        if (!canProject) {
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip("Mesh must be unwrapped or atlas-packed first");
+            }
+        }
+        
+        ImGui::Separator();
+        
+        if (ImGui::Button("Export to OBJ (O)", ImVec2(-1, 0))) {
+            g_triggerObjExport = true;
+        }
+    }
+    
+    // --- Animation Section ---
+    if (ImGui::CollapsingHeader("Animation", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::Checkbox("Animate", &g_AnimateMesh)) {
+            std::cout << "Animation: " << (g_AnimateMesh ? "ON" : "OFF") << std::endl;
+        }
+        
+        // Status indicators
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Status:");
+        
+        if (g_isUnwrapped) {
+            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.4f, 1.0f), "  Unwrapped");
+        }
+        if (g_isAtlasPacked) {
+            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.4f, 1.0f), "  Atlas Packed");
+        }
+        if (g_hasProjectedTexture) {
+            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.4f, 1.0f), "  Texture Baked");
+        }
+        
+        ImGui::Text("Vertices: %u", mesh.GetTotalVertexCount());
+        if (g_isUnwrapped) {
+            ImGui::Text("Indices: %u", g_indexCount);
+        }
+    }
+    
+    // --- Camera Section ---
+    if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
+        bool freeMode = g_camera.IsFreeCameraMode();
+        
+        if (ImGui::Checkbox("Free Camera (F)", &freeMode)) {
+            g_camera.SetFreeCameraMode(freeMode);
+            if (freeMode) {
+                g_rotateView = false;
+                std::cout << "Free camera mode: ON" << std::endl;
+            } else {
+                std::cout << "Free camera mode: OFF (orbit mode)" << std::endl;
+            }
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("WASD to move, Alt+Mouse to look\nShift for speed, +/- to adjust");
+        }
+        
+        if (!freeMode) {
+            if (ImGui::Checkbox("Orbit Rotation (C)", &g_rotateView)) {
+                std::cout << "View rotation: " << (g_rotateView ? "ON" : "OFF") << std::endl;
+            }
+        } else {
+            ImGui::BeginDisabled();
+            bool dummy = false;
+            ImGui::Checkbox("Orbit Rotation (C)", &dummy);
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip("Only available in orbit mode");
+            }
+        }
+        
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Mode: %s", freeMode ? "Free" : "Orbit");
+        if (!freeMode) {
+            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Orbit: %s", g_rotateView ? "Rotating" : "Stopped");
+        }
+    }
+    
+    ImGui::End();
+}
+
 void ExportMeshToOBJ() {
     std::cout << "Exporting mesh to OBJ..." << std::endl;
     
@@ -988,7 +1242,7 @@ void ExportMeshToOBJ() {
 
 int main() {
     initGL();
-    mesh.Initialize(CELL_SIZE, make_float3(-1.1f, -1.1f, -1.1f), make_float3(1.1f, 1.1f, 1.1f));
+    mesh.Initialize(g_cellSize, make_float3(-1.1f, -1.1f, -1.1f), make_float3(1.1f, 1.1f, 1.1f));
     // UV generation is controlled by passing non-null pointers to Update()
     g_enableUVGeneration = true;  // Enable flag
     
@@ -1115,33 +1369,12 @@ int main() {
     glDisable(GL_CULL_FACE); // Disable culling to see both sides
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 
-    // Print controls to console
-    std::cout << "\n=== CONTROLS ===" << std::endl;
-    std::cout << "--- Camera ---" << std::endl;
-    std::cout << "F: Toggle free camera mode (WASD + Alt+Mouse)" << std::endl;
-    std::cout << "WASD: Move camera (free mode only)" << std::endl;
-    std::cout << "Alt+Mouse: Rotate camera (free mode only)" << std::endl;
-    std::cout << "Shift: Move faster (free mode only)" << std::endl;
-    std::cout << "+/-: Adjust movement speed" << std::endl;
-    std::cout << "C: Toggle view rotation (orbit mode only)" << std::endl;
-    std::cout << "--- Rendering ---" << std::endl;
-    std::cout << "Q: Toggle wireframe" << std::endl;
-    std::cout << "V: Toggle UV generation" << std::endl;
-    std::cout << "T: Toggle texture array mode" << std::endl;
-    std::cout << "N: Toggle vertex normals (ON=accurate for displacements, OFF=SDF gradient)" << std::endl;
-    std::cout << "--- Mesh ---" << std::endl;
-    std::cout << "M: Marching Cubes" << std::endl;
-    std::cout << "X: Dual Contouring" << std::endl;
-    std::cout << "[]: Decrease/Increase DC normal smooth angle" << std::endl;
-    std::cout << "--- UV/Export ---" << std::endl;
-    std::cout << "U: Unwrap mesh" << std::endl;
-    std::cout << "A: CUDA atlas-pack existing UV charts (primitive UVs -> single atlas)" << std::endl;
-    std::cout << "P: Perform projection baking" << std::endl;
-    std::cout << "O: Export mesh to OBJ" << std::endl;
-    std::cout << "--- Other ---" << std::endl;
-    std::cout << "SPACE: Toggle animation" << std::endl;
-    std::cout << "ESC: Exit" << std::endl;
-    std::cout << "================\n" << std::endl;
+    // Print startup info
+    std::cout << "\n=== CudaSDF Started ===" << std::endl;
+    std::cout << "Controls available in the ImGui panel on the left." << std::endl;
+    std::cout << "Camera: F=free mode, WASD=move, Alt+Mouse=look, C=orbit toggle" << std::endl;
+    std::cout << "ESC to exit" << std::endl;
+    std::cout << "========================\n" << std::endl;
 
     double lastFPSTime = glfwGetTime();
     int frameCount = 0;
@@ -1166,6 +1399,11 @@ int main() {
             g_simTime += dt;
         }
         float simTime = (float)g_simTime;
+        
+        // Start ImGui frame
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
         
         // Camera update
         if (g_camera.IsFreeCameraMode()) {
@@ -1256,7 +1494,7 @@ int main() {
             }
             
             // Update mesh with UV generation and normals
-            mesh.Update(simTime, d_vboPtr, d_cboPtr, d_iboPtr, d_uvPtr, d_primIDPtr, d_normalPtr, g_meshTechnique, g_dcNormalSmoothAngleDeg);
+            mesh.Update(simTime, d_vboPtr, d_cboPtr, d_iboPtr, d_uvPtr, d_primIDPtr, d_normalPtr, g_meshTechnique, g_dcNormalSmoothAngleDeg, g_dcQefBlend);
             
             cudaGraphicsUnmapResources(1, &cudaVBO, 0);
             cudaGraphicsUnmapResources(1, &cudaCBO, 0);
@@ -1380,6 +1618,27 @@ int main() {
             ExportMeshToOBJ();
         }
         // --------------------------
+        
+        // --- Grid Rebuild Trigger ---
+        if (g_triggerGridRebuild) {
+            g_triggerGridRebuild = false;
+            std::cout << "Rebuilding grid with size " << g_gridSize << "..." << std::endl;
+            
+            // Reset mesh state flags
+            g_isUnwrapped = false;
+            g_isAtlasPacked = false;
+            g_hasProjectedTexture = false;
+            
+            // Reinitialize mesh with new cell size
+            mesh.ClearPrimitives();
+            mesh.Initialize(g_cellSize, make_float3(-1.1f, -1.1f, -1.1f), make_float3(1.1f, 1.1f, 1.1f));
+            
+            // Re-add primitives (they will be re-added in the update loop)
+            g_meshDirty = true;
+            
+            std::cout << "Grid rebuilt. Cell size: " << g_cellSize << std::endl;
+        }
+        // ----------------------------
 
         // Update UBO from Mesh (it might have sorted them)
         const auto& currentGPUPrimitives = mesh.GetGPUPrimitives();
@@ -1493,12 +1752,22 @@ int main() {
             }
             glDrawArrays(GL_TRIANGLES, 0, mesh.GetTotalVertexCount());
         }
+        
+        // Render ImGui
+        RenderUI();
+        ImGui::Render();
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
 
-    // Cleanup
+    // Cleanup ImGui
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    
+    // Cleanup GLFW
     glfwTerminate();
     return 0;
 }

@@ -1345,7 +1345,7 @@ __global__ void dcMarkCells(SDFGrid grid, float time) {
     grid.d_packetVertexCounts[packetIdx] = (allIn || allOut) ? 0u : 1u;
 }
 
-__global__ void dcSolveCellVertices(SDFGrid grid, float time, unsigned int maxCellVertices) {
+__global__ void dcSolveCellVertices(SDFGrid grid, float time, unsigned int maxCellVertices, float qefBlend) {
     const int activeBlockId = blockIdx.x;
     if (activeBlockId >= *grid.d_activeBlockCount) return;
 
@@ -1566,6 +1566,16 @@ __global__ void dcSolveCellVertices(SDFGrid grid, float time, unsigned int maxCe
         make_float3(cellMax.x + margin, cellMax.y + margin, cellMax.z + margin)
     );
     x = clamp3(x, cellMin, cellMax);
+    
+    // QEF blend: 0 = blocky (cell center), 1 = full QEF solve
+    // cellCenter is the center of the voxel cell
+    const float3 cellCenter = make_float3(
+        cellMin.x + 0.5f * grid.cellSize,
+        cellMin.y + 0.5f * grid.cellSize,
+        cellMin.z + 0.5f * grid.cellSize
+    );
+    x = lerp3(cellCenter, x, qefBlend);
+    
     grid.d_dcCellVertices[vIdx] = encodeCellVertexLocal(x, cellMin, grid.cellSize);
 
     // Store a smooth per-cell-vertex normal:

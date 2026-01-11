@@ -12,7 +12,7 @@ extern __global__ void generateActiveBlockTriangles(SDFGrid grid, float time);
 // Dual Contouring kernels (implemented in MarchingCubesKernels.cu for now)
 extern __global__ void buildBlockToActiveMap(SDFGrid grid);
 extern __global__ void dcMarkCells(SDFGrid grid, float time);
-extern __global__ void dcSolveCellVertices(SDFGrid grid, float time, unsigned int maxCellVertices);
+extern __global__ void dcSolveCellVertices(SDFGrid grid, float time, unsigned int maxCellVertices, float qefBlend);
 extern __global__ void dcSmoothCellNormals(SDFGrid grid, float cosAngleThreshold);
 extern __global__ void dcCountQuads(SDFGrid grid);
 extern __global__ void dcGenerateQuads(SDFGrid grid, float time);
@@ -53,10 +53,10 @@ extern "C" void launchDCMarkCells(SDFGrid& grid, int numActiveBlocks, float time
     dcMarkCells<<<numActiveBlocks, threads>>>(grid, time);
 }
 
-extern "C" void launchDCSolveCellVertices(SDFGrid& grid, int numActiveBlocks, float time, unsigned int maxCellVertices) {
+extern "C" void launchDCSolveCellVertices(SDFGrid& grid, int numActiveBlocks, float time, unsigned int maxCellVertices, float qefBlend) {
     if (numActiveBlocks == 0) return;
     int threads = SDF_BLOCK_SIZE_CUBED; // 512
-    dcSolveCellVertices<<<numActiveBlocks, threads>>>(grid, time, maxCellVertices);
+    dcSolveCellVertices<<<numActiveBlocks, threads>>>(grid, time, maxCellVertices, qefBlend);
 }
 
 extern "C" void launchDCSmoothCellNormals(SDFGrid& grid, int numActiveBlocks, float cosAngleThreshold) {

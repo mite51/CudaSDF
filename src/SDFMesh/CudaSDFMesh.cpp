@@ -19,7 +19,7 @@ extern "C" void launchGenerateActiveBlockTriangles(SDFGrid& grid, int numActiveB
 // Dual Contouring wrappers
 extern "C" void launchBuildBlockToActiveMap(SDFGrid& grid, int numActiveBlocks);
 extern "C" void launchDCMarkCells(SDFGrid& grid, int numActiveBlocks, float time);
-extern "C" void launchDCSolveCellVertices(SDFGrid& grid, int numActiveBlocks, float time, unsigned int maxCellVertices);
+extern "C" void launchDCSolveCellVertices(SDFGrid& grid, int numActiveBlocks, float time, unsigned int maxCellVertices, float qefBlend);
 extern "C" void launchDCSmoothCellNormals(SDFGrid& grid, int numActiveBlocks, float cosAngleThreshold);
 extern "C" void launchDCCountQuads(SDFGrid& grid, int numActiveBlocks);
 extern "C" void launchDCGenerateQuads(SDFGrid& grid, int numActiveBlocks, float time);
@@ -250,7 +250,8 @@ CudaSDFMesh::MemStats CudaSDFMesh::GetMemoryStats() const {
 
 void CudaSDFMesh::Update(float time, float4* d_outVertices, float4* d_outColors, unsigned int* d_outIndices,
                          float2* d_outUVs, int* d_outPrimitiveIDs, float4* d_outNormals,
-                         MeshExtractionTechnique technique, float dcNormalSmoothAngleDeg) {
+                         MeshExtractionTechnique technique, float dcNormalSmoothAngleDeg,
+                         float dcQefBlend) {
     UpdateBVH();
     
     // Upload Primitives
@@ -365,7 +366,7 @@ void CudaSDFMesh::Update(float time, float4* d_outVertices, float4* d_outColors,
         launchScan(d_grid.d_packetVertexCounts, d_grid.d_dcCellVertexOffsets, totalItems, d_temp_storage, temp_storage_bytes);
 
         // Pass 2: solve cell vertices into compact buffer
-        launchDCSolveCellVertices(d_grid, numActiveBlocks, time, h_grid.maxVertices);
+        launchDCSolveCellVertices(d_grid, numActiveBlocks, time, h_grid.maxVertices, dcQefBlend);
 
         // Optional: smooth DC normals across neighboring cell-vertices (adaptive by angle threshold).
         // This reduces "voxel-ish" shading, especially under displacement, without touching geometry.

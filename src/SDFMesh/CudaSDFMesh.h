@@ -28,7 +28,8 @@ public:
     void Update(float time, float4* d_outVertices, float4* d_outColors, unsigned int* d_outIndices,
                 float2* d_outUVs = nullptr, int* d_outPrimitiveIDs = nullptr, float4* d_outNormals = nullptr,
                 MeshExtractionTechnique technique = MeshExtractionTechnique::MarchingCubes,
-                float dcNormalSmoothAngleDeg = 30.0f);
+                float dcNormalSmoothAngleDeg = 30.0f,
+                float dcQefBlend = 1.0f);
 
     // Getters for Renderer to update its buffers
     const std::vector<BVHNode>& GetBVHNodes() const { return m_bvhNodes; }
