@@ -138,6 +138,14 @@ void CudaSDFMesh::Initialize(float cellSize, float3 boundsMin, float3 boundsMax)
     if(d_grid.d_packetVertexCounts) cudaFree(d_grid.d_packetVertexCounts);
     if(d_grid.d_packetVertexOffsets) cudaFree(d_grid.d_packetVertexOffsets);
     
+    // Also free Dual Contouring buffers so they get reallocated with correct sizes
+    if(d_grid.d_blockToActiveId) { cudaFree(d_grid.d_blockToActiveId); d_grid.d_blockToActiveId = nullptr; }
+    if(d_grid.d_dcCornerMasks) { cudaFree(d_grid.d_dcCornerMasks); d_grid.d_dcCornerMasks = nullptr; }
+    if(d_grid.d_dcCellVertexOffsets) { cudaFree(d_grid.d_dcCellVertexOffsets); d_grid.d_dcCellVertexOffsets = nullptr; }
+    if(d_grid.d_dcCellVertices) { cudaFree(d_grid.d_dcCellVertices); d_grid.d_dcCellVertices = nullptr; }
+    if(d_grid.d_dcCellNormals) { cudaFree(d_grid.d_dcCellNormals); d_grid.d_dcCellNormals = nullptr; }
+    if(d_grid.d_dcCellNormalsTmp) { cudaFree(d_grid.d_dcCellNormalsTmp); d_grid.d_dcCellNormalsTmp = nullptr; }
+    
     m_allocatedGridBytes = 0;
     
     checkCudaErrors(cudaMalloc(&d_grid.d_activeBlocks, h_grid.maxBlocks * sizeof(int)));
@@ -291,7 +299,7 @@ void CudaSDFMesh::Update(float time, float4* d_outVertices, float4* d_outColors,
     d_grid.numBVHPrimitives = h_grid.numBVHPrimitives;
     
     static size_t primAllocSize = 0;
-    if (primAllocSize < m_primitives.size() * sizeof(SDFPrimitive)) {
+    if (!d_grid.d_primitives || primAllocSize < m_primitives.size() * sizeof(SDFPrimitive)) {
         if (d_grid.d_primitives) cudaFree(d_grid.d_primitives);
         primAllocSize = std::max(m_primitives.size() * sizeof(SDFPrimitive) * 2, (size_t)1024);
         checkCudaErrors(cudaMalloc(&d_grid.d_primitives, primAllocSize));
@@ -304,7 +312,7 @@ void CudaSDFMesh::Update(float time, float4* d_outVertices, float4* d_outColors,
     d_grid.numBVHNodes = h_grid.numBVHNodes;
     
     static size_t bvhAllocSize = 0;
-    if (bvhAllocSize < m_bvhNodes.size() * sizeof(BVHNode)) {
+    if (!d_grid.d_bvhNodes || bvhAllocSize < m_bvhNodes.size() * sizeof(BVHNode)) {
         if (d_grid.d_bvhNodes) cudaFree(d_grid.d_bvhNodes);
         bvhAllocSize = std::max(m_bvhNodes.size() * sizeof(BVHNode) * 2, (size_t)1024);
         checkCudaErrors(cudaMalloc(&d_grid.d_bvhNodes, bvhAllocSize));

@@ -27,7 +27,7 @@
 #include "DebugDraw.h"
 
 // Global variables
-float g_gridSize = 32.0f;  // Mutable grid size (adjustable in UI)
+float g_gridSize = 32.0f;  
 float g_cellSize = 1.0f / g_gridSize;  // Computed from grid size
 const unsigned int WINDOW_WIDTH = 1024;
 const unsigned int WINDOW_HEIGHT = 768;
@@ -1009,7 +1009,6 @@ void RenderUI() {
     
     // --- Mesh Extraction Section ---
     if (ImGui::CollapsingHeader("Mesh Extraction", ImGuiTreeNodeFlags_DefaultOpen)) {
-        /* Disabled until changing grid size is implemented
         // Grid Size
         ImGui::SetNextItemWidth(120);
         int gridSizeInt = (int)g_gridSize;
@@ -1026,7 +1025,6 @@ void RenderUI() {
         }
         
         ImGui::Separator();
-        */
         
         bool isMC = (g_meshTechnique == MeshExtractionTechnique::MarchingCubes);
         bool isDC = (g_meshTechnique == MeshExtractionTechnique::DualContouring);
