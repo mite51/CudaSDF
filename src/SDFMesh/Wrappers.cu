@@ -22,18 +22,30 @@ extern "C" void launchScoutActiveBlocks(SDFGrid& grid, float time) {
     int threads = 256;
     int blocks = (numBlocks + threads - 1) / threads;
     scoutActiveBlocks<<<blocks, threads>>>(grid, time);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("[WRAPPER] ERROR launching scoutActiveBlocks: %s\n", cudaGetErrorString(err));
+    }
 }
 
 extern "C" void launchCountActiveBlockTriangles(SDFGrid& grid, int numActiveBlocks, float time) {
     if (numActiveBlocks == 0) return;
     int threads = SDF_BLOCK_SIZE_CUBED; // 512 for 8^3
     countActiveBlockTriangles<<<numActiveBlocks, threads>>>(grid, time);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("[WRAPPER] ERROR launching countActiveBlockTriangles: %s\n", cudaGetErrorString(err));
+    }
 }
 
 extern "C" void launchGenerateActiveBlockTriangles(SDFGrid& grid, int numActiveBlocks, float time) {
     if (numActiveBlocks == 0) return;
     int threads = SDF_BLOCK_SIZE_CUBED; // 512 for 8^3
     generateActiveBlockTriangles<<<numActiveBlocks, threads>>>(grid, time);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("[WRAPPER] ERROR launching generateActiveBlockTriangles: %s\n", cudaGetErrorString(err));
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -45,36 +57,60 @@ extern "C" void launchBuildBlockToActiveMap(SDFGrid& grid, int numActiveBlocks) 
     int threads = 256;
     int blocks = (numActiveBlocks + threads - 1) / threads;
     buildBlockToActiveMap<<<blocks, threads>>>(grid);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("[WRAPPER] ERROR launching buildBlockToActiveMap: %s\n", cudaGetErrorString(err));
+    }
 }
 
 extern "C" void launchDCMarkCells(SDFGrid& grid, int numActiveBlocks, float time) {
     if (numActiveBlocks == 0) return;
     int threads = SDF_BLOCK_SIZE_CUBED; // 512
     dcMarkCells<<<numActiveBlocks, threads>>>(grid, time);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("[WRAPPER] ERROR launching dcMarkCells: %s\n", cudaGetErrorString(err));
+    }
 }
 
 extern "C" void launchDCSolveCellVertices(SDFGrid& grid, int numActiveBlocks, float time, unsigned int maxCellVertices, float qefBlend) {
     if (numActiveBlocks == 0) return;
     int threads = SDF_BLOCK_SIZE_CUBED; // 512
     dcSolveCellVertices<<<numActiveBlocks, threads>>>(grid, time, maxCellVertices, qefBlend);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("[WRAPPER] ERROR launching dcSolveCellVertices: %s\n", cudaGetErrorString(err));
+    }
 }
 
 extern "C" void launchDCSmoothCellNormals(SDFGrid& grid, int numActiveBlocks, float cosAngleThreshold) {
     if (numActiveBlocks == 0) return;
     int threads = SDF_BLOCK_SIZE_CUBED; // 512
     dcSmoothCellNormals<<<numActiveBlocks, threads>>>(grid, cosAngleThreshold);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("[WRAPPER] ERROR launching dcSmoothCellNormals: %s\n", cudaGetErrorString(err));
+    }
 }
 
 extern "C" void launchDCCountQuads(SDFGrid& grid, int numActiveBlocks) {
     if (numActiveBlocks == 0) return;
     int threads = SDF_BLOCK_SIZE_CUBED; // 512
     dcCountQuads<<<numActiveBlocks, threads>>>(grid);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("[WRAPPER] ERROR launching dcCountQuads: %s\n", cudaGetErrorString(err));
+    }
 }
 
 extern "C" void launchDCGenerateQuads(SDFGrid& grid, int numActiveBlocks, float time) {
     if (numActiveBlocks == 0) return;
     int threads = SDF_BLOCK_SIZE_CUBED; // 512
     dcGenerateQuads<<<numActiveBlocks, threads>>>(grid, time);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("[WRAPPER] ERROR launching dcGenerateQuads: %s\n", cudaGetErrorString(err));
+    }
 }
 
 extern "C" void getScanStorageSize(unsigned int num_items, size_t* temp_storage_bytes) {

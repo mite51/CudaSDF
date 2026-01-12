@@ -963,6 +963,10 @@ std::vector<Island> CreateIslands(
             gridResolution,
             island.mask
         );
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            printf("[WRAPPER] ERROR launching rasterizeIslandKernel: %s\n", cudaGetErrorString(err));
+        }
         cudaDeviceSynchronize();
         
         // Create collision mask (dilated)
@@ -978,6 +982,10 @@ std::vector<Island> CreateIslands(
                 island.collisionMask,
                 marginCells
             );
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                printf("[WRAPPER] ERROR launching dilateGridKernel: %s\n", cudaGetErrorString(err));
+            }
             cudaDeviceSynchronize();
         } else {
             // Copy mask to collision mask
@@ -997,6 +1005,10 @@ std::vector<Island> CreateIslands(
                 (island.mask90.height + blockDim.y - 1) / blockDim.y
             );
             rotateGridKernel<<<gridDim, blockDim>>>(island.mask, island.mask90, 1);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                printf("[WRAPPER] ERROR launching rotateGridKernel (mask): %s\n", cudaGetErrorString(err));
+            }
         }
 
         {
@@ -1006,6 +1018,10 @@ std::vector<Island> CreateIslands(
                 (island.collisionMask90.height + blockDim.y - 1) / blockDim.y
             );
             rotateGridKernel<<<gridDim, blockDim>>>(island.collisionMask, island.collisionMask90, 1);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                printf("[WRAPPER] ERROR launching rotateGridKernel (collisionMask): %s\n", cudaGetErrorString(err));
+            }
         }
 
         cudaDeviceSynchronize();
@@ -1017,7 +1033,15 @@ std::vector<Island> CreateIslands(
         cudaMalloc(&island.d_collMaxWord90, island.collisionMask90.height * sizeof(uint16_t));
 
         computeRowWordBoundsKernel<<<island.collisionMask.height, 128>>>(island.collisionMask, island.d_collMinWord, island.d_collMaxWord);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            printf("[WRAPPER] ERROR launching computeRowWordBoundsKernel (rot0): %s\n", cudaGetErrorString(err));
+        }
         computeRowWordBoundsKernel<<<island.collisionMask90.height, 128>>>(island.collisionMask90, island.d_collMinWord90, island.d_collMaxWord90);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            printf("[WRAPPER] ERROR launching computeRowWordBoundsKernel (rot90): %s\n", cudaGetErrorString(err));
+        }
         cudaDeviceSynchronize();
         
         islands.push_back(island);
@@ -1136,6 +1160,10 @@ PackedAtlas PackIslands(
         config.maxDropSteps,
         config.shuffleOrderPerAttempt
     );
+    cudaError_t launchErr = cudaGetLastError();
+    if (launchErr != cudaSuccess) {
+        printf("[WRAPPER] ERROR launching packSolutionKernel: %s\n", cudaGetErrorString(launchErr));
+    }
     
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
@@ -1494,6 +1522,10 @@ void RemapUVsToAtlas(
         atlas.atlasWidth,     // Actual utilized width
         atlas.atlasHeight     // Actual utilized height
     );
+    cudaError_t remapErr = cudaGetLastError();
+    if (remapErr != cudaSuccess) {
+        printf("[WRAPPER] ERROR launching remapUVsKernel: %s\n", cudaGetErrorString(remapErr));
+    }
     cudaDeviceSynchronize();
     
     // Debug: Download a few UVs to verify remapping worked
