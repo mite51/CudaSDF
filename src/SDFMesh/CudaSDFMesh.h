@@ -53,6 +53,31 @@ public:
     };
     
     MemStats GetMemoryStats() const;
+    
+    // Kernel Timing Statistics (in milliseconds)
+    struct KernelTimings {
+        // Common
+        float scoutActiveBlocks = 0.0f;
+        float scan1 = 0.0f;              // First prefix sum
+        float scan2 = 0.0f;              // Second prefix sum (DC only)
+        float totalKernelTime = 0.0f;
+        
+        // Marching Cubes specific
+        float mcCountTriangles = 0.0f;
+        float mcGenerateTriangles = 0.0f;
+        
+        // Dual Contouring specific
+        float dcBuildBlockMap = 0.0f;
+        float dcMarkCells = 0.0f;
+        float dcSolveCellVertices = 0.0f;
+        float dcCountQuads = 0.0f;
+        float dcGenerateQuads = 0.0f;
+        
+        // Which technique was used
+        MeshExtractionTechnique technique = MeshExtractionTechnique::MarchingCubes;
+    };
+    
+    const KernelTimings& GetKernelTimings() const { return m_kernelTimings; }
 
     // Get mesh bounds (for debug visualization)
     void GetBounds(float3& outMin, float3& outMax) const {
@@ -92,6 +117,15 @@ private:
     size_t m_allocatedPrimBytes = 0;
     size_t m_allocatedBVHBytes = 0;
     size_t m_allocatedGridBytes = 0;
+    
+    // Kernel timing
+    KernelTimings m_kernelTimings;
+    cudaEvent_t m_eventStart = nullptr;
+    cudaEvent_t m_eventStop = nullptr;
+    bool m_timingEventsInitialized = false;
+    
+    void InitTimingEvents();
+    float TimeKernel(cudaEvent_t start, cudaEvent_t stop);
     
     // Helper to sort and build BVH
     void UpdateBVH();

@@ -45,6 +45,12 @@ CudaSDFMesh::CudaSDFMesh() {
 }
 
 CudaSDFMesh::~CudaSDFMesh() {
+    // Cleanup timing events
+    if (m_timingEventsInitialized) {
+        cudaEventDestroy(m_eventStart);
+        cudaEventDestroy(m_eventStop);
+    }
+    
     // Cleanup
     if (d_grid.d_activeBlocks) cudaFree(d_grid.d_activeBlocks);
     if (d_grid.d_activeBlockCount) cudaFree(d_grid.d_activeBlockCount);
@@ -64,6 +70,21 @@ CudaSDFMesh::~CudaSDFMesh() {
     if (d_totalVertsPtr) cudaFree(d_totalVertsPtr);
     if (d_totalIndicesPtr) cudaFree(d_totalIndicesPtr);
     if (d_temp_storage) cudaFree(d_temp_storage);
+}
+
+void CudaSDFMesh::InitTimingEvents() {
+    if (!m_timingEventsInitialized) {
+        cudaEventCreate(&m_eventStart);
+        cudaEventCreate(&m_eventStop);
+        m_timingEventsInitialized = true;
+    }
+}
+
+float CudaSDFMesh::TimeKernel(cudaEvent_t start, cudaEvent_t stop) {
+    float ms = 0.0f;
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&ms, start, stop);
+    return ms;
 }
 
 void CudaSDFMesh::Initialize(float cellSize, float3 boundsMin, float3 boundsMax) {
@@ -253,6 +274,14 @@ void CudaSDFMesh::Update(float time, float4* d_outVertices, float4* d_outColors,
                          float2* d_outUVs, int* d_outPrimitiveIDs, float4* d_outNormals,
                          MeshExtractionTechnique technique, float dcNormalSmoothAngleDeg,
                          float dcQefBlend) {
+    // Initialize timing events if needed
+    InitTimingEvents();
+    
+    // Reset timings
+    m_kernelTimings = KernelTimings();
+    m_kernelTimings.technique = technique;
+    float totalTime = 0.0f;
+    
     UpdateBVH();
     
     // Upload Primitives
@@ -287,15 +316,19 @@ void CudaSDFMesh::Update(float time, float4* d_outVertices, float4* d_outColors,
     d_grid.d_vertices = d_outVertices;
     d_grid.d_vertexColors = d_outColors;
     d_grid.d_indices = d_outIndices;
-    d_grid.d_uvCoords = d_outUVs;              // NEW
-    d_grid.d_primitiveIDs = d_outPrimitiveIDs; // NEW
-    d_grid.d_normals = d_outNormals;           // NEW
+    d_grid.d_uvCoords = d_outUVs;
+    d_grid.d_primitiveIDs = d_outPrimitiveIDs;
+    d_grid.d_normals = d_outNormals;
     d_grid.d_totalVertices = d_totalVertsPtr;
     d_grid.d_totalIndices = d_totalIndicesPtr;
     
-    // 1. Scout Active Blocks
+    // 1. Scout Active Blocks (timed)
     checkCudaErrors(cudaMemset(d_grid.d_activeBlockCount, 0, sizeof(int)));
+    cudaEventRecord(m_eventStart);
     launchScoutActiveBlocks(d_grid, time);
+    cudaEventRecord(m_eventStop);
+    m_kernelTimings.scoutActiveBlocks = TimeKernel(m_eventStart, m_eventStop);
+    totalTime += m_kernelTimings.scoutActiveBlocks;
     
     int numActiveBlocks = 0;
     checkCudaErrors(cudaMemcpy(&numActiveBlocks, d_grid.d_activeBlockCount, sizeof(int), cudaMemcpyDeviceToHost));
@@ -303,6 +336,7 @@ void CudaSDFMesh::Update(float time, float4* d_outVertices, float4* d_outColors,
     if (numActiveBlocks <= 0) {
         m_totalVertices = 0;
         m_totalIndices = 0;
+        m_kernelTimings.totalKernelTime = totalTime;
         return;
     }
 
@@ -315,14 +349,26 @@ void CudaSDFMesh::Update(float time, float4* d_outVertices, float4* d_outColors,
     const int totalItems = numActiveBlocks * SDF_BLOCK_SIZE_CUBED;
 
     if (technique == MeshExtractionTechnique::MarchingCubes) {
-        // 2. Count Triangles per Active Voxel
+        // 2. Count Triangles per Active Voxel (timed)
+        cudaEventRecord(m_eventStart);
         launchCountActiveBlockTriangles(d_grid, numActiveBlocks, time);
+        cudaEventRecord(m_eventStop);
+        m_kernelTimings.mcCountTriangles = TimeKernel(m_eventStart, m_eventStop);
+        totalTime += m_kernelTimings.mcCountTriangles;
 
-        // 3. Scan
+        // 3. Scan (timed)
+        cudaEventRecord(m_eventStart);
         launchScan(d_grid.d_packetVertexCounts, d_grid.d_packetVertexOffsets, totalItems, d_temp_storage, temp_storage_bytes);
+        cudaEventRecord(m_eventStop);
+        m_kernelTimings.scan1 = TimeKernel(m_eventStart, m_eventStop);
+        totalTime += m_kernelTimings.scan1;
 
-        // 4. Generate Triangles (Soup)
+        // 4. Generate Triangles (Soup) (timed)
+        cudaEventRecord(m_eventStart);
         launchGenerateActiveBlockTriangles(d_grid, numActiveBlocks, time);
+        cudaEventRecord(m_eventStop);
+        m_kernelTimings.mcGenerateTriangles = TimeKernel(m_eventStart, m_eventStop);
+        totalTime += m_kernelTimings.mcGenerateTriangles;
 
     } else {
         // --------------------------
@@ -342,12 +388,10 @@ void CudaSDFMesh::Update(float time, float4* d_outVertices, float4* d_outColors,
             m_allocatedGridBytes += m_packedSize * sizeof(unsigned int);
         }
         if (!d_grid.d_dcCellVertices) {
-            // Store compacted cell vertices up to maxVertices entries (8 bytes each)
             checkCudaErrors(cudaMalloc(&d_grid.d_dcCellVertices, h_grid.maxVertices * sizeof(ushort4)));
             m_allocatedGridBytes += h_grid.maxVertices * sizeof(ushort4);
         }
         if (!d_grid.d_dcCellNormals) {
-            // Store compacted cell normals up to maxVertices entries (8 bytes each)
             checkCudaErrors(cudaMalloc(&d_grid.d_dcCellNormals, h_grid.maxVertices * sizeof(short4)));
             m_allocatedGridBytes += h_grid.maxVertices * sizeof(short4);
         }
@@ -356,33 +400,58 @@ void CudaSDFMesh::Update(float time, float4* d_outVertices, float4* d_outColors,
             m_allocatedGridBytes += h_grid.maxVertices * sizeof(short4);
         }
 
-        // Build block -> activeBlockId mapping (needed for cross-block quad assembly)
-        checkCudaErrors(cudaMemset(d_grid.d_blockToActiveId, 0xFF, h_grid.maxBlocks * sizeof(int))); // -1
+        // Build block -> activeBlockId mapping (timed)
+        checkCudaErrors(cudaMemset(d_grid.d_blockToActiveId, 0xFF, h_grid.maxBlocks * sizeof(int)));
+        cudaEventRecord(m_eventStart);
         launchBuildBlockToActiveMap(d_grid, numActiveBlocks);
+        cudaEventRecord(m_eventStop);
+        m_kernelTimings.dcBuildBlockMap = TimeKernel(m_eventStart, m_eventStop);
+        totalTime += m_kernelTimings.dcBuildBlockMap;
 
-        // Pass 1: mark cells with crossings + store corner masks; counts = hasVertex (0/1)
+        // Pass 1: mark cells (timed)
+        cudaEventRecord(m_eventStart);
         launchDCMarkCells(d_grid, numActiveBlocks, time);
+        cudaEventRecord(m_eventStop);
+        m_kernelTimings.dcMarkCells = TimeKernel(m_eventStart, m_eventStop);
+        totalTime += m_kernelTimings.dcMarkCells;
 
-        // Scan 1: hasVertex (counts) -> dcCellVertexOffsets (compact cell-vertex indices)
+        // Scan 1 (timed)
+        cudaEventRecord(m_eventStart);
         launchScan(d_grid.d_packetVertexCounts, d_grid.d_dcCellVertexOffsets, totalItems, d_temp_storage, temp_storage_bytes);
+        cudaEventRecord(m_eventStop);
+        m_kernelTimings.scan1 = TimeKernel(m_eventStart, m_eventStop);
+        totalTime += m_kernelTimings.scan1;
 
-        // Pass 2: solve cell vertices into compact buffer
+        // Pass 2: solve cell vertices (timed)
+        cudaEventRecord(m_eventStart);
         launchDCSolveCellVertices(d_grid, numActiveBlocks, time, h_grid.maxVertices, dcQefBlend);
+        cudaEventRecord(m_eventStop);
+        m_kernelTimings.dcSolveCellVertices = TimeKernel(m_eventStart, m_eventStop);
+        totalTime += m_kernelTimings.dcSolveCellVertices;
 
-        // NOTE: Per-cell normal recomputation and smoothing are no longer needed.
-        // Normals are now computed per-triangle-vertex in dcGenerateQuads using the triangle's
-        // face normal to offset the sampling position. This gives better normals at shared edges
-        // because each triangle uses its own face direction for the offset.
-
-        // Pass 3: count quads (as 2 tris = 6 soup vertices) into packetVertexCounts
+        // Pass 3: count quads (timed)
+        cudaEventRecord(m_eventStart);
         launchDCCountQuads(d_grid, numActiveBlocks);
+        cudaEventRecord(m_eventStop);
+        m_kernelTimings.dcCountQuads = TimeKernel(m_eventStart, m_eventStop);
+        totalTime += m_kernelTimings.dcCountQuads;
 
-        // Scan 2: triangle soup offsets
+        // Scan 2 (timed)
+        cudaEventRecord(m_eventStart);
         launchScan(d_grid.d_packetVertexCounts, d_grid.d_packetVertexOffsets, totalItems, d_temp_storage, temp_storage_bytes);
+        cudaEventRecord(m_eventStop);
+        m_kernelTimings.scan2 = TimeKernel(m_eventStart, m_eventStop);
+        totalTime += m_kernelTimings.scan2;
 
-        // Pass 4: generate soup vertices/UV/IDs/normals
+        // Pass 4: generate quads (timed)
+        cudaEventRecord(m_eventStart);
         launchDCGenerateQuads(d_grid, numActiveBlocks, time);
+        cudaEventRecord(m_eventStop);
+        m_kernelTimings.dcGenerateQuads = TimeKernel(m_eventStart, m_eventStop);
+        totalTime += m_kernelTimings.dcGenerateQuads;
     }
+
+    m_kernelTimings.totalKernelTime = totalTime;
 
     // Readback Total Count
     unsigned int lastOffset, lastCount;

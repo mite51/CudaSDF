@@ -72,11 +72,15 @@ bool g_useTextureArray = false; // DISABLE to test basic rendering
 bool g_textureArrayValid = false; // NEW: Track if texture array loaded successfully
 bool g_useVertexNormals = true; // NEW: Use precomputed vertex normals (better for displacements)
 uint32_t g_indexCount = 0; // Number of indices for indexed drawing
-MeshExtractionTechnique g_meshTechnique = MeshExtractionTechnique::MarchingCubes;
+MeshExtractionTechnique g_meshTechnique = MeshExtractionTechnique::DualContouring;
 float g_dcNormalSmoothAngleDeg = 30.0f;
 float g_dcQefBlend = 1.0f; // QEF blend: 0 = blocky (cell center), 1 = full QEF solve
 bool g_wireframeMode = false; // Wireframe rendering toggle
 bool g_triggerGridRebuild = false; // Trigger to rebuild grid with new size
+
+// Performance metrics
+float g_currentFPS = 0.0f;
+float g_frameTimeMs = 0.0f;
 
 // Camera
 Camera g_camera;
@@ -922,6 +926,36 @@ void RenderUI() {
     
     ImGui::Begin("Controls", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
     
+    // --- Performance Section ---
+    if (ImGui::CollapsingHeader("Performance", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Text("FPS: %.0f", g_currentFPS);
+        ImGui::Text("Frame Time: %.2f ms", g_frameTimeMs);
+        ImGui::Text("Vertices: %u", mesh.GetTotalVertexCount());
+        
+        ImGui::Separator();
+        const auto& timings = mesh.GetKernelTimings();
+        ImGui::Text("GPU Kernel Time: %.2f ms", timings.totalKernelTime);
+        
+        if (ImGui::TreeNode("Kernel Breakdown")) {
+            ImGui::Text("Scout Blocks: %.3f ms", timings.scoutActiveBlocks);
+            
+            if (timings.technique == MeshExtractionTechnique::MarchingCubes) {
+                ImGui::Text("Count Triangles: %.3f ms", timings.mcCountTriangles);
+                ImGui::Text("Scan: %.3f ms", timings.scan1);
+                ImGui::Text("Generate Tris: %.3f ms", timings.mcGenerateTriangles);
+            } else {
+                ImGui::Text("Build Block Map: %.3f ms", timings.dcBuildBlockMap);
+                ImGui::Text("Mark Cells: %.3f ms", timings.dcMarkCells);
+                ImGui::Text("Scan 1: %.3f ms", timings.scan1);
+                ImGui::Text("Solve Vertices: %.3f ms", timings.dcSolveCellVertices);
+                ImGui::Text("Count Quads: %.3f ms", timings.dcCountQuads);
+                ImGui::Text("Scan 2: %.3f ms", timings.scan2);
+                ImGui::Text("Generate Quads: %.3f ms", timings.dcGenerateQuads);
+            }
+            ImGui::TreePop();
+        }
+    }
+    
     // --- Rendering Section ---
     if (ImGui::CollapsingHeader("Rendering", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (ImGui::Checkbox("Wireframe", &g_wireframeMode)) {
@@ -1011,12 +1045,6 @@ void RenderUI() {
         
         if (isDC) {
             ImGui::SetNextItemWidth(150);
-            if (ImGui::SliderFloat("Normal Smooth Angle", &g_dcNormalSmoothAngleDeg, 0.0f, 89.0f, "%.0f deg")) {
-                std::cout << "DC normal smooth angle: " << g_dcNormalSmoothAngleDeg << " deg" << std::endl;
-                g_meshDirty = true;
-            }
-            
-            ImGui::SetNextItemWidth(150);
             if (ImGui::SliderFloat("QEF Blend", &g_dcQefBlend, 0.0f, 1.0f, "%.2f")) {
                 g_meshDirty = true;
             }
@@ -1098,7 +1126,6 @@ void RenderUI() {
             ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.4f, 1.0f), "  Texture Baked");
         }
         
-        ImGui::Text("Vertices: %u", mesh.GetTotalVertexCount());
         if (g_isUnwrapped) {
             ImGui::Text("Indices: %u", g_indexCount);
         }
@@ -1420,8 +1447,7 @@ int main() {
         double currentTime = glfwGetTime();
         frameCount++;
         if (currentTime - lastFPSTime >= 1.0) {
-            std::string title = "CUDA Marching Cubes (Sparse) - " + std::to_string(frameCount) + " FPS";
-            glfwSetWindowTitle(window, title.c_str());
+            g_currentFPS = (float)frameCount;
             frameCount = 0;
             lastFPSTime = currentTime;
         }
@@ -1431,6 +1457,7 @@ int main() {
         g_lastFrameTime = currentTime;
         if (dt < 0.0) dt = 0.0;
         if (dt > 0.25) dt = 0.25; // clamp huge hitches (breakpoints, window drag, etc.)
+        g_frameTimeMs = (float)(dt * 1000.0);  // Convert to milliseconds
         if (g_AnimateMesh) {
             g_simTime += dt;
         }

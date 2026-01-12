@@ -1880,13 +1880,11 @@ __global__ void dcGenerateQuads(SDFGrid grid, float time) {
 
         // Enforce consistent winding against SDF gradient to avoid "spike" triangles from flipped quads.
         // If the quad is oriented opposite the local surface normal, flip (swap v1 <-> v3).
-        bool didFlip = false;
         {
             const float3 nRef = computeNormal(quadCenter, grid, time);
             const float3 nTri = cross3(v1 - v0, v2 - v0);
             if (dot(nTri, nRef) < 0.0f) {
                 const float3 tmp = v1; v1 = v3; v3 = tmp;
-                didFlip = true;
             }
         }
 
