@@ -13,6 +13,7 @@ extern __global__ void generateActiveBlockTriangles(SDFGrid grid, float time);
 extern __global__ void buildBlockToActiveMap(SDFGrid grid);
 extern __global__ void dcMarkCells(SDFGrid grid, float time);
 extern __global__ void dcSolveCellVertices(SDFGrid grid, float time, unsigned int maxCellVertices, float qefBlend);
+extern __global__ void dcRecomputeNormalsAtVertices(SDFGrid grid, float time);
 extern __global__ void dcSmoothCellNormals(SDFGrid grid, float cosAngleThreshold);
 extern __global__ void dcCountQuads(SDFGrid grid);
 extern __global__ void dcGenerateQuads(SDFGrid grid, float time);
@@ -80,6 +81,16 @@ extern "C" void launchDCSolveCellVertices(SDFGrid& grid, int numActiveBlocks, fl
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("[WRAPPER] ERROR launching dcSolveCellVertices: %s\n", cudaGetErrorString(err));
+    }
+}
+
+extern "C" void launchDCRecomputeNormalsAtVertices(SDFGrid& grid, int numActiveBlocks, float time) {
+    if (numActiveBlocks == 0) return;
+    int threads = SDF_BLOCK_SIZE_CUBED; // 512
+    dcRecomputeNormalsAtVertices<<<numActiveBlocks, threads>>>(grid, time);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("[WRAPPER] ERROR launching dcRecomputeNormalsAtVertices: %s\n", cudaGetErrorString(err));
     }
 }
 

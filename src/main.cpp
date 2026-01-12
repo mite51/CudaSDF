@@ -87,6 +87,9 @@ bool g_mouseInitialized = false;
 // Debug Drawing
 DebugDraw g_debugDrawInstance;
 bool g_showBoundingBox = false;
+bool g_showNormals = false;
+int g_normalSkip = 100;  // Draw every Nth normal (performance control)
+float g_normalLength = 0.05f;  // Length of normal debug lines
 
 void checkGLErrors(const char* label) {
     GLenum err;
@@ -443,6 +446,10 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
         if (key == GLFW_KEY_B) {  // Toggle bounding box display
             g_showBoundingBox = !g_showBoundingBox;
             std::cout << "Bounding box: " << (g_showBoundingBox ? "ON" : "OFF") << std::endl;
+        }
+        if (key == GLFW_KEY_N) {  // Toggle normal visualization
+            g_showNormals = !g_showNormals;
+            std::cout << "Normals: " << (g_showNormals ? "ON" : "OFF") << std::endl;
         }
         if (key == GLFW_KEY_ESCAPE) {
             glfwSetWindowShouldClose(window, true);
@@ -923,6 +930,16 @@ void RenderUI() {
         
         if (ImGui::Checkbox("Show Bounding Box (B)", &g_showBoundingBox)) {
             std::cout << "Bounding box: " << (g_showBoundingBox ? "ON" : "OFF") << std::endl;
+        }
+        
+        if (ImGui::Checkbox("Show Normals (N)", &g_showNormals)) {
+            std::cout << "Normals: " << (g_showNormals ? "ON" : "OFF") << std::endl;
+        }
+        if (g_showNormals) {
+            ImGui::Indent();
+            ImGui::SliderInt("Skip", &g_normalSkip, 1, 500, "Every %d");
+            ImGui::SliderFloat("Length", &g_normalLength, 0.01f, 0.2f, "%.3f");
+            ImGui::Unindent();
         }
         
         if (ImGui::Checkbox("UV Generation", &g_enableUVGeneration)) {
@@ -1772,21 +1789,61 @@ int main() {
             glDrawArrays(GL_TRIANGLES, 0, mesh.GetTotalVertexCount());
         }
         
-        // Debug Draw - Bounding Box
-        if (g_showBoundingBox && g_debugDraw) {
-            float3 boundsMin, boundsMax;
-            mesh.GetBounds(boundsMin, boundsMax);
+        // Debug Draw
+        if (g_debugDraw && (g_showBoundingBox || g_showNormals)) {
+            // Bounding Box
+            if (g_showBoundingBox) {
+                float3 boundsMin, boundsMax;
+                mesh.GetBounds(boundsMin, boundsMax);
+                
+                // Draw bounding box with cyan color
+                g_debugDraw->AddBox(
+                    boundsMin.x, boundsMin.y, boundsMin.z,
+                    boundsMax.x, boundsMax.y, boundsMax.z,
+                    0.0f, 1.0f, 1.0f, 1.0f,  // Cyan color
+                    0.005f  // Line width
+                );
+                
+                // Add axes at origin for reference
+                g_debugDraw->AddAxes(0.0f, 0.0f, 0.0f, 0.2f, 0.008f);
+            }
             
-            // Draw bounding box with cyan color
-            g_debugDraw->AddBox(
-                boundsMin.x, boundsMin.y, boundsMin.z,
-                boundsMax.x, boundsMax.y, boundsMax.z,
-                0.0f, 1.0f, 1.0f, 1.0f,  // Cyan color
-                0.005f  // Line width
-            );
-            
-            // Add axes at origin for reference
-            g_debugDraw->AddAxes(0.0f, 0.0f, 0.0f, 0.2f, 0.008f);
+            // Normal Visualization
+            if (g_showNormals && mesh.GetTotalVertexCount() > 0) {
+                // Read back vertex positions from VBO
+                glBindBuffer(GL_ARRAY_BUFFER, vbo);
+                int vertCount = mesh.GetTotalVertexCount();
+                std::vector<float> vertexData(vertCount * 4);
+                glGetBufferSubData(GL_ARRAY_BUFFER, 0, vertCount * 4 * sizeof(float), vertexData.data());
+                
+                // Read back normals from Normal BO
+                glBindBuffer(GL_ARRAY_BUFFER, normalbo);
+                std::vector<float> normalData(vertCount * 4);
+                glGetBufferSubData(GL_ARRAY_BUFFER, 0, vertCount * 4 * sizeof(float), normalData.data());
+                glBindBuffer(GL_ARRAY_BUFFER, 0);
+                
+                // Draw normals as lines (every g_normalSkip vertices)
+                int skip = std::max(1, g_normalSkip);
+                for (int i = 0; i < vertCount; i += skip) {
+                    float px = vertexData[i * 4 + 0];
+                    float py = vertexData[i * 4 + 1];
+                    float pz = vertexData[i * 4 + 2];
+                    
+                    float nx = normalData[i * 4 + 0];
+                    float ny = normalData[i * 4 + 1];
+                    float nz = normalData[i * 4 + 2];
+                    
+                    // Draw line from vertex position along normal direction
+                    g_debugDraw->AddLine(
+                        px, py, pz,
+                        px + nx * g_normalLength, 
+                        py + ny * g_normalLength, 
+                        pz + nz * g_normalLength,
+                        0.0f, 1.0f, 0.0f, 1.0f,  // Green for positive direction
+                        0.002f, 0.002f
+                    );
+                }
+            }
             
             g_debugDraw->Render(view, projection);
         }

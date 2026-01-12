@@ -812,7 +812,7 @@ __device__ void map(float3 p_world, const SDFGrid& grid, float time, float& outD
 // --------------------------------------------------------------------------
 
 __device__ inline float3 computeNormal(float3 p, const SDFGrid& grid, float time) {
-    const float h = 0.001f;  // Small epsilon for finite differences
+    const float h = grid.cellSize * 0.001f;  // Small epsilon for finite differences
     
     float dist_c, dist_x, dist_y, dist_z;
     float3 color_temp;
@@ -1596,6 +1596,39 @@ __global__ void dcSolveCellVertices(SDFGrid grid, float time, unsigned int maxCe
     }
 }
 
+// Recompute normals at the final QEF-solved vertex positions.
+// This pass runs AFTER dcSolveCellVertices to ensure normals reflect the actual
+// vertex locations rather than averaged Hermite edge data.
+__global__ void dcRecomputeNormalsAtVertices(SDFGrid grid, float time) {
+    const int activeBlockId = blockIdx.x;
+    if (activeBlockId >= *grid.d_activeBlockCount) return;
+
+    const int blockIndex = grid.d_activeBlocks[activeBlockId];
+    const int tid = (int)threadIdx.x;
+    const int packetIdx = activeBlockId * SDF_BLOCK_SIZE_CUBED + tid;
+
+    if (!grid.d_dcCellNormals) return;
+
+    // Check if this cell has a vertex
+    if (grid.d_packetVertexCounts[packetIdx] == 0) return;
+
+    const int4 xyz = getGlobalCoordsFromBlock(blockIndex, tid, grid);
+    if (outOfBounds(grid, xyz)) return;
+
+    const unsigned int vIdx = grid.d_dcCellVertexOffsets[packetIdx];
+    if (vIdx >= grid.maxVertices) return;
+
+    // Decode the solved vertex position to world space
+    const float3 cellMin = getLocation(grid, xyz);
+    const float3 vWorld = decodeCellVertexWorld(grid.d_dcCellVertices[vIdx], cellMin, grid.cellSize);
+
+    // Compute normal at the solved vertex position using SDF gradient
+    const float3 normal = computeNormal(vWorld, grid, time);
+
+    // Store the recomputed normal
+    grid.d_dcCellNormals[vIdx] = encodeCellNormal(normal);
+}
+
 // Helper: lookup packed-cell index for a global cell coordinate. Returns false if block not active.
 __device__ __forceinline__ bool lookupPackedCell(
     const SDFGrid& grid,
@@ -1879,26 +1912,66 @@ __global__ void dcGenerateQuads(SDFGrid grid, float time) {
             computeQuadUVs(localPos, prim, time, quadUVs);
         }
 
-        // Fetch smooth per-cell-vertex normals (one per DC cell vertex), fallback to quadCenter gradient if not available.
-        float3 n0 = make_float3(0.0f, 1.0f, 0.0f);
-        float3 n1 = n0, n2 = n0, n3 = n0;
-        if (grid.d_dcCellNormals) {
-            // If we flipped winding by swapping v1/v3, we must also swap which cell-normal is paired with those vertices.
-            const unsigned int ni1 = didFlip ? i3 : i1;
-            const unsigned int ni3 = didFlip ? i1 : i3;
-            n0 = decodeCellNormal(grid.d_dcCellNormals[i0]);
-            n1 = decodeCellNormal(grid.d_dcCellNormals[ni1]);
-            n2 = decodeCellNormal(grid.d_dcCellNormals[i2]);
-            n3 = decodeCellNormal(grid.d_dcCellNormals[ni3]);
-        } else if (grid.d_normals) {
-            const float3 nRef = computeNormal(quadCenter, grid, time);
-            n0 = n1 = n2 = n3 = nRef;
+        // Compute per-triangle normals using the triangle's face normal for offset
+        // This ensures shared vertices get correct normals based on which triangle they belong to
+        const float offset = grid.cellSize * 0.25f;
+        
+        // Triangle 1: (v0, v1, v2)
+        float3 triVerts1[3] = {v0, v1, v2};
+        float3 triNorms1[3];
+        {
+            // Compute geometric face normal for triangle 1
+            const float3 e1 = v1 - v0;
+            const float3 e2 = v2 - v0;
+            float3 faceN = cross3(e1, e2);
+            float len = sqrtf(faceN.x*faceN.x + faceN.y*faceN.y + faceN.z*faceN.z);
+            if (len > 1e-6f) {
+                faceN = make_float3(faceN.x/len, faceN.y/len, faceN.z/len);
+            } else {
+                faceN = computeNormal(quadCenter, grid, time);
+            }
+            
+            // Compute normal for each vertex by offsetting along face normal
+            for (int i = 0; i < 3; ++i) {
+                const float3 samplePos = make_float3(
+                    triVerts1[i].x + faceN.x * offset,
+                    triVerts1[i].y + faceN.y * offset,
+                    triVerts1[i].z + faceN.z * offset
+                );
+                triNorms1[i] = computeNormal(samplePos, grid, time);
+            }
+        }
+        
+        // Triangle 2: (v0, v2, v3)
+        float3 triVerts2[3] = {v0, v2, v3};
+        float3 triNorms2[3];
+        {
+            // Compute geometric face normal for triangle 2
+            const float3 e1 = v2 - v0;
+            const float3 e2 = v3 - v0;
+            float3 faceN = cross3(e1, e2);
+            float len = sqrtf(faceN.x*faceN.x + faceN.y*faceN.y + faceN.z*faceN.z);
+            if (len > 1e-6f) {
+                faceN = make_float3(faceN.x/len, faceN.y/len, faceN.z/len);
+            } else {
+                faceN = computeNormal(quadCenter, grid, time);
+            }
+            
+            // Compute normal for each vertex by offsetting along face normal
+            for (int i = 0; i < 3; ++i) {
+                const float3 samplePos = make_float3(
+                    triVerts2[i].x + faceN.x * offset,
+                    triVerts2[i].y + faceN.y * offset,
+                    triVerts2[i].z + faceN.z * offset
+                );
+                triNorms2[i] = computeNormal(samplePos, grid, time);
+            }
         }
 
         // Emit two triangles: (0,1,2) and (0,2,3)
         const float3 tri[6] = {v0, v1, v2, v0, v2, v3};
         const float2 triUV[6] = {quadUVs[0], quadUVs[1], quadUVs[2], quadUVs[0], quadUVs[2], quadUVs[3]};
-        const float3 triN[6] = {n0, n1, n2, n0, n2, n3};
+        const float3 triN[6] = {triNorms1[0], triNorms1[1], triNorms1[2], triNorms2[0], triNorms2[1], triNorms2[2]};
 
         if (write + 5 >= grid.maxVertices) return;
 

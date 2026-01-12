@@ -20,6 +20,7 @@ extern "C" void launchGenerateActiveBlockTriangles(SDFGrid& grid, int numActiveB
 extern "C" void launchBuildBlockToActiveMap(SDFGrid& grid, int numActiveBlocks);
 extern "C" void launchDCMarkCells(SDFGrid& grid, int numActiveBlocks, float time);
 extern "C" void launchDCSolveCellVertices(SDFGrid& grid, int numActiveBlocks, float time, unsigned int maxCellVertices, float qefBlend);
+extern "C" void launchDCRecomputeNormalsAtVertices(SDFGrid& grid, int numActiveBlocks, float time);
 extern "C" void launchDCSmoothCellNormals(SDFGrid& grid, int numActiveBlocks, float cosAngleThreshold);
 extern "C" void launchDCCountQuads(SDFGrid& grid, int numActiveBlocks);
 extern "C" void launchDCGenerateQuads(SDFGrid& grid, int numActiveBlocks, float time);
@@ -368,15 +369,10 @@ void CudaSDFMesh::Update(float time, float4* d_outVertices, float4* d_outColors,
         // Pass 2: solve cell vertices into compact buffer
         launchDCSolveCellVertices(d_grid, numActiveBlocks, time, h_grid.maxVertices, dcQefBlend);
 
-        // Optional: smooth DC normals across neighboring cell-vertices (adaptive by angle threshold).
-        // This reduces "voxel-ish" shading, especially under displacement, without touching geometry.
-        if (d_grid.d_normals && d_grid.d_dcCellNormals && d_grid.d_dcCellNormalsTmp) {
-            const float deg = std::max(0.0f, std::min(dcNormalSmoothAngleDeg, 89.0f));
-            const float cosThresh = cosf(deg * 3.14159265358979323846f / 180.0f);
-            launchDCSmoothCellNormals(d_grid, numActiveBlocks, cosThresh);
-            // Swap buffers so subsequent passes read the smoothed normals
-            std::swap(d_grid.d_dcCellNormals, d_grid.d_dcCellNormalsTmp);
-        }
+        // NOTE: Per-cell normal recomputation and smoothing are no longer needed.
+        // Normals are now computed per-triangle-vertex in dcGenerateQuads using the triangle's
+        // face normal to offset the sampling position. This gives better normals at shared edges
+        // because each triangle uses its own face direction for the offset.
 
         // Pass 3: count quads (as 2 tris = 6 soup vertices) into packetVertexCounts
         launchDCCountQuads(d_grid, numActiveBlocks);
