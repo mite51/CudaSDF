@@ -18,9 +18,6 @@
 #include "SDFMesh/CudaSDFMesh.h"
 #include "SDFMesh/CudaSDFUtil.h" 
 #include "SDFMesh/GridUVPacker.cuh"
-#include "uv_unwrap_harmonic_parameterization/unwrap/unwrap_pipeline.h"
-#include "uv_unwrap_harmonic_parameterization/unwrap/seam_splitter.h"
-#include "uv_unwrap_harmonic_parameterization/common/mesh.h"
 
 #include "SDFMesh/TextureLoader.h"
 #include "Camera.h"
@@ -54,7 +51,6 @@ GLuint uboPrimitives; // UBO Handle
 GLuint tboBVH, texBVH; // BVH Texture Buffer
 
 CudaSDFMesh mesh;
-bool g_triggerUnwrap = false;
 bool g_triggerAtlasPack = false; // NEW: CUDA atlas packing trigger
 bool g_triggerProjection = false; // Flag to trigger projection baking
 bool g_triggerObjExport = false; // Flag to trigger OBJ export
@@ -64,14 +60,12 @@ bool g_rotateView = true; // NEW: Toggle camera/view rotation
 double g_cameraAngle = 0.0; // View orbit angle (advances with real dt when view rotation is ON)
 double g_simTime = 0.0;    // Simulation time (advances only when animation is ON)
 double g_lastFrameTime = 0.0;
-bool g_isUnwrapped = false; // Track if mesh has been unwrapped
-bool g_isAtlasPacked = false; // NEW: Track if UVs have been repacked into a single atlas (triangle soup)
+bool g_isAtlasPacked = false; // Track if UVs have been repacked into a single atlas (triangle soup)
 bool g_hasProjectedTexture = false; // Track if texture has been projection baked
 bool g_enableUVGeneration = false; // DISABLE to test basic rendering
 bool g_useTextureArray = false; // DISABLE to test basic rendering
 bool g_textureArrayValid = false; // NEW: Track if texture array loaded successfully
 bool g_useVertexNormals = true; // NEW: Use precomputed vertex normals (better for displacements)
-uint32_t g_indexCount = 0; // Number of indices for indexed drawing
 MeshExtractionTechnique g_meshTechnique = MeshExtractionTechnique::DualContouring;
 float g_dcNormalSmoothAngleDeg = 30.0f;
 float g_dcQefBlend = 1.0f; // QEF blend: 0 = blocky (cell center), 1 = full QEF solve
@@ -389,9 +383,6 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
         }
         if (key == GLFW_KEY_MINUS || key == GLFW_KEY_KP_SUBTRACT) {  // - key
             g_camera.AdjustSpeed(-0.5f);
-        }
-        if (key == GLFW_KEY_U) {
-            g_triggerUnwrap = true;
         }
         if (key == GLFW_KEY_A) {
             if(!freeMode)
@@ -739,103 +730,9 @@ void initGL() {
     }
 }
 
-// Helpers for unwrap
-struct VertexKey {
-    int x, y, z;
-    bool operator<(const VertexKey& o) const {
-        if (x != o.x) return x < o.x;
-        if (y != o.y) return y < o.y;
-        return z < o.z;
-    }
-};
-
-uv::Mesh WeldMesh(const std::vector<float4>& rawVerts) {
-    uv::Mesh mesh;
-    std::map<VertexKey, uint32_t> uniqueMap;
-    // Quantize factor for welding
-    float q = 10000.0f; 
-    
-    for(size_t i=0; i<rawVerts.size(); ++i) {
-        uv::vec3 v = {rawVerts[i].x, rawVerts[i].y, rawVerts[i].z};
-        VertexKey key = { (int)(v.x * q), (int)(v.y * q), (int)(v.z * q) };
-        
-        if (uniqueMap.find(key) == uniqueMap.end()) {
-            uniqueMap[key] = (uint32_t)mesh.V.size();
-            mesh.V.push_back(v);
-        }
-        uint32_t idx = uniqueMap[key];
-        
-        // Add to triangles
-        // We know input is triangle soup, so every 3 verts = 1 tri
-        if (i % 3 == 0) mesh.F.push_back({0,0,0});
-        
-        uint32_t& triIdx = (i % 3 == 0) ? mesh.F.back().x : ((i % 3 == 1) ? mesh.F.back().y : mesh.F.back().z);
-        triIdx = idx;
-    }
-    return mesh;
-}
-
-void PerformUnwrap(const std::vector<float4>& rawVerts) {
-    if (rawVerts.empty()) {
-        std::cout << "No vertices to unwrap!" << std::endl;
-        return;
-    }
-    
-    std::cout << "Welding " << rawVerts.size() << " vertices..." << std::endl;
-    uv::Mesh mesh = WeldMesh(rawVerts);
-    std::cout << "Weld result: " << mesh.V.size() << " vertices, " << mesh.F.size() << " triangles." << std::endl;
-    
-    uv::UnwrapConfig cfg;
-    cfg.atlasMaxSize = 8192; // Increased to reduce packing failure chance
-    cfg.paddingPx = 2;       // Reduced padding to save space
-    
-    uv::UnwrapPipeline pipeline;
-    uv::UnwrapResult res = pipeline.Run(mesh, cfg);
-    
-    // Split vertices to handle hard UV seams
-    uv::Mesh splitMesh;
-    uv::UnwrapResult splitRes;
-    uv::SplitVerticesByChart(mesh, res, splitMesh, splitRes);
-    
-    // Prepare CPU buffers
-    std::vector<float4> unwrappedVerts(splitMesh.V.size());
-    std::vector<float2> unwrappedUVs(splitMesh.V.size());
-    for(size_t i=0; i<splitMesh.V.size(); ++i) {
-        unwrappedVerts[i] = make_float4(splitMesh.V[i].x, splitMesh.V[i].y, splitMesh.V[i].z, 1.0f);
-        unwrappedUVs[i] = make_float2(splitRes.uvAtlas[i].x, splitRes.uvAtlas[i].y);
-    }
-    
-    // Flatten Indices (for IBO)
-    std::vector<uint32_t> unwrappedIndices(splitMesh.F.size() * 3);
-    if (!splitMesh.F.empty()) {
-        memcpy(unwrappedIndices.data(), splitMesh.F.data(), splitMesh.F.size() * sizeof(uv::uvec3));
-    }
-    
-    // Update main VAO buffers in-place
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, unwrappedVerts.size() * sizeof(float4), unwrappedVerts.data(), GL_STATIC_DRAW);
-    
-    glBindBuffer(GL_ARRAY_BUFFER, uvbo);
-    glBufferData(GL_ARRAY_BUFFER, unwrappedUVs.size() * sizeof(float2), unwrappedUVs.data(), GL_STATIC_DRAW);
-    
-    // Enable UV attribute array now that we have valid data
-    glBindVertexArray(vao);
-    glEnableVertexAttribArray(2);
-    glBindVertexArray(0);
-    
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, unwrappedIndices.size() * sizeof(uint32_t), unwrappedIndices.data(), GL_STATIC_DRAW);
-    
-    // Store count for indexed rendering
-    g_indexCount = (uint32_t)unwrappedIndices.size();
-    g_isUnwrapped = true;
-    
-    std::cout << "Mesh unwrapped and updated in-place." << std::endl;
-}
-
 void PerformProjectionBaking(const float* model, const float* view, const float* projection, int textureSize = 2048) {
-    if (!g_isUnwrapped && !g_isAtlasPacked) {
-        std::cout << "Mesh must be unwrapped or atlas-packed before projection baking!" << std::endl;
+    if (!g_isAtlasPacked) {
+        std::cout << "Mesh must be atlas-packed before projection baking!" << std::endl;
         return;
     }
     
@@ -902,14 +799,9 @@ void PerformProjectionBaking(const float* model, const float* view, const float*
     glBindTexture(GL_TEXTURE_2D, g_textureID);
     glUniform1i(glGetUniformLocation(projectionShaderProgram, "sourceTexture"), 0);
     
-    // Draw the mesh
+    // Draw the mesh (atlas-packed triangle soup)
     glBindVertexArray(vao);
-    if (g_isUnwrapped) {
-        glDrawElements(GL_TRIANGLES, (GLsizei)g_indexCount, GL_UNSIGNED_INT, 0);
-    } else {
-        // Atlas-packed triangle soup path
-        glDrawArrays(GL_TRIANGLES, 0, mesh.GetTotalVertexCount());
-    }
+    glDrawArrays(GL_TRIANGLES, 0, mesh.GetTotalVertexCount());
     
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     
@@ -981,7 +873,7 @@ void RenderUI() {
             g_meshDirty = true;
         }
         
-        bool canUseTextureArray = g_textureArrayValid && !g_isUnwrapped && !g_isAtlasPacked;
+        bool canUseTextureArray = g_textureArrayValid && !g_isAtlasPacked;
         if (!canUseTextureArray) {
             ImGui::BeginDisabled();
         }
@@ -995,7 +887,7 @@ void RenderUI() {
         if (!canUseTextureArray) {
             ImGui::EndDisabled();
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-                ImGui::SetTooltip("Requires valid texture array and no unwrap/atlas");
+                ImGui::SetTooltip("Requires valid texture array and no atlas");
             }
         }
         
@@ -1054,22 +946,7 @@ void RenderUI() {
     
     // --- UV / Export Section ---
     if (ImGui::CollapsingHeader("UV / Export", ImGuiTreeNodeFlags_DefaultOpen)) {
-        bool meshLocked = g_isUnwrapped || g_isAtlasPacked;
-        
-        if (meshLocked) {
-            ImGui::BeginDisabled();
-        }
-        if (ImGui::Button("Unwrap Mesh (U)", ImVec2(-1, 0))) {
-            g_triggerUnwrap = true;
-        }
-        if (meshLocked) {
-            ImGui::EndDisabled();
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-                ImGui::SetTooltip("Mesh already unwrapped or atlas-packed");
-            }
-        }
-        
-        bool canAtlasPack = g_enableUVGeneration && !meshLocked;
+        bool canAtlasPack = g_enableUVGeneration && !g_isAtlasPacked;
         if (!canAtlasPack) {
             ImGui::BeginDisabled();
         }
@@ -1083,7 +960,7 @@ void RenderUI() {
             }
         }
         
-        bool canProject = g_isUnwrapped || g_isAtlasPacked;
+        bool canProject = g_isAtlasPacked;
         if (!canProject) {
             ImGui::BeginDisabled();
         }
@@ -1093,7 +970,7 @@ void RenderUI() {
         if (!canProject) {
             ImGui::EndDisabled();
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-                ImGui::SetTooltip("Mesh must be unwrapped or atlas-packed first");
+                ImGui::SetTooltip("Mesh must be atlas-packed first");
             }
         }
         
@@ -1114,18 +991,11 @@ void RenderUI() {
         ImGui::Separator();
         ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Status:");
         
-        if (g_isUnwrapped) {
-            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.4f, 1.0f), "  Unwrapped");
-        }
         if (g_isAtlasPacked) {
             ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.4f, 1.0f), "  Atlas Packed");
         }
         if (g_hasProjectedTexture) {
             ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.4f, 1.0f), "  Texture Baked");
-        }
-        
-        if (g_isUnwrapped) {
-            ImGui::Text("Indices: %u", g_indexCount);
         }
     }
     
@@ -1190,108 +1060,55 @@ void ExportMeshToOBJ() {
     objFile << "# Generated: " << filename << std::endl;
     objFile << std::endl;
     
-    if (g_isUnwrapped) {
-        // Export unwrapped mesh with proper indexing
-        std::cout << "Exporting unwrapped mesh with " << g_indexCount << " indices..." << std::endl;
-        
-        // Read vertex positions from VBO
-        glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        size_t vertexCount = g_indexCount; // Maximum possible vertices
-        std::vector<float4> vertices(vertexCount);
-        glGetBufferSubData(GL_ARRAY_BUFFER, 0, vertexCount * sizeof(float4), vertices.data());
-        
-        // Read UVs from UVBO
+    // Export triangle soup mesh
+    uint32_t vertexCount = mesh.GetTotalVertexCount();
+    std::cout << "Exporting triangle soup with " << vertexCount << " vertices..." << std::endl;
+    
+    if (vertexCount == 0) {
+        std::cout << "ERROR: No vertices to export!" << std::endl;
+        objFile.close();
+        return;
+    }
+    
+    // Read vertex positions from VBO
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    std::vector<float4> vertices(vertexCount);
+    glGetBufferSubData(GL_ARRAY_BUFFER, 0, vertexCount * sizeof(float4), vertices.data());
+    
+    // Read UVs from UVBO (if available)
+    std::vector<float2> uvs(vertexCount);
+    bool hasUVs = g_enableUVGeneration;
+    if (hasUVs) {
         glBindBuffer(GL_ARRAY_BUFFER, uvbo);
-        std::vector<float2> uvs(vertexCount);
         glGetBufferSubData(GL_ARRAY_BUFFER, 0, vertexCount * sizeof(float2), uvs.data());
-        
-        // Read indices from IBO
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
-        std::vector<uint32_t> indices(g_indexCount);
-        glGetBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, g_indexCount * sizeof(uint32_t), indices.data());
-        
-        // Find actual unique vertex count
-        uint32_t maxIndex = 0;
-        for (uint32_t idx : indices) {
-            maxIndex = std::max(maxIndex, idx);
-        }
-        uint32_t actualVertexCount = maxIndex + 1;
-        
-        std::cout << "Unique vertices: " << actualVertexCount << ", Triangles: " << (g_indexCount / 3) << std::endl;
-        
-        // Write vertices
-        for (uint32_t i = 0; i < actualVertexCount; ++i) {
-            objFile << "v " << vertices[i].x << " " << vertices[i].y << " " << vertices[i].z << std::endl;
-        }
-        objFile << std::endl;
-        
-        // Write UVs
-        for (uint32_t i = 0; i < actualVertexCount; ++i) {
+    }
+    
+    // Write vertices
+    for (uint32_t i = 0; i < vertexCount; ++i) {
+        objFile << "v " << vertices[i].x << " " << vertices[i].y << " " << vertices[i].z << std::endl;
+    }
+    objFile << std::endl;
+    
+    // Write UVs if available
+    if (hasUVs) {
+        for (uint32_t i = 0; i < vertexCount; ++i) {
             objFile << "vt " << uvs[i].x << " " << uvs[i].y << std::endl;
         }
         objFile << std::endl;
+    }
+    
+    // Write faces (triangle soup - each vertex is unique)
+    for (uint32_t i = 0; i < vertexCount; i += 3) {
+        uint32_t i0 = i + 1;
+        uint32_t i1 = i + 2;
+        uint32_t i2 = i + 3;
         
-        // Write faces (OBJ uses 1-based indexing)
-        for (size_t i = 0; i < indices.size(); i += 3) {
-            uint32_t i0 = indices[i] + 1;
-            uint32_t i1 = indices[i + 1] + 1;
-            uint32_t i2 = indices[i + 2] + 1;
+        if (hasUVs) {
             objFile << "f " << i0 << "/" << i0 << " " 
                     << i1 << "/" << i1 << " " 
                     << i2 << "/" << i2 << std::endl;
-        }
-        
-    } else {
-        // Export triangle soup (non-unwrapped mesh)
-        uint32_t vertexCount = mesh.GetTotalVertexCount();
-        std::cout << "Exporting triangle soup with " << vertexCount << " vertices..." << std::endl;
-        
-        if (vertexCount == 0) {
-            std::cout << "ERROR: No vertices to export!" << std::endl;
-            objFile.close();
-            return;
-        }
-        
-        // Read vertex positions from VBO
-        glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        std::vector<float4> vertices(vertexCount);
-        glGetBufferSubData(GL_ARRAY_BUFFER, 0, vertexCount * sizeof(float4), vertices.data());
-        
-        // Read UVs from UVBO (if available)
-        std::vector<float2> uvs(vertexCount);
-        bool hasUVs = g_enableUVGeneration;
-        if (hasUVs) {
-            glBindBuffer(GL_ARRAY_BUFFER, uvbo);
-            glGetBufferSubData(GL_ARRAY_BUFFER, 0, vertexCount * sizeof(float2), uvs.data());
-        }
-        
-        // Write vertices
-        for (uint32_t i = 0; i < vertexCount; ++i) {
-            objFile << "v " << vertices[i].x << " " << vertices[i].y << " " << vertices[i].z << std::endl;
-        }
-        objFile << std::endl;
-        
-        // Write UVs if available
-        if (hasUVs) {
-            for (uint32_t i = 0; i < vertexCount; ++i) {
-                objFile << "vt " << uvs[i].x << " " << uvs[i].y << std::endl;
-            }
-            objFile << std::endl;
-        }
-        
-        // Write faces (triangle soup - each vertex is unique)
-        for (uint32_t i = 0; i < vertexCount; i += 3) {
-            uint32_t i0 = i + 1;
-            uint32_t i1 = i + 2;
-            uint32_t i2 = i + 3;
-            
-            if (hasUVs) {
-                objFile << "f " << i0 << "/" << i0 << " " 
-                        << i1 << "/" << i1 << " " 
-                        << i2 << "/" << i2 << std::endl;
-            } else {
-                objFile << "f " << i0 << " " << i1 << " " << i2 << std::endl;
-            }
+        } else {
+            objFile << "f " << i0 << " " << i1 << " " << i2 << std::endl;
         }
     }
     
@@ -1484,8 +1301,8 @@ int main() {
         }
 
         // Update mesh if animating OR if something toggled that requires a rebuild.
-        // NOTEF: If the mesh has been unwrapped or atlas-packed, we treat it as "locked" and do not overwrite buffers.
-        const bool meshLocked = (g_isUnwrapped || g_isAtlasPacked);
+        // NOTE: If the mesh has been atlas-packed, we treat it as "locked" and do not overwrite buffers.
+        const bool meshLocked = g_isAtlasPacked;
         const bool shouldUpdateMesh = (!meshLocked) && (g_AnimateMesh || g_meshDirty);
         if (shouldUpdateMesh) {
             if (g_AnimateMesh) {
@@ -1569,38 +1386,6 @@ int main() {
 
             g_meshDirty = false;
         }
-
-        // --- UV Unwrap Trigger ---
-        if (g_triggerUnwrap) {
-            g_triggerUnwrap = false;
-            
-            // Map the *current* buffers to read the current mesh state for unwrap
-            // We assume the mesh was updated at least once before this.
-            if (cudaGraphicsMapResources(1, &cudaVBO, 0) != cudaSuccess) break;
-            
-            float4* d_vboPtr;
-            size_t size;
-            cudaGraphicsResourceGetMappedPointer((void**)&d_vboPtr, &size, cudaVBO);
-            
-            unsigned int count = mesh.GetTotalVertexCount();
-            if (count > 0) {
-                std::vector<float4> hostVerts(count);
-                cudaMemcpy(hostVerts.data(), d_vboPtr, count * sizeof(float4), cudaMemcpyDeviceToHost);
-                
-                // Unmap before doing heavy CPU work
-                cudaGraphicsUnmapResources(1, &cudaVBO, 0); 
-                
-                PerformUnwrap(hostVerts);
-                
-                // After unwrap, stop updating the mesh so we can see the result
-                g_AnimateMesh = false;
-                g_meshDirty = false;
-            } else {
-                std::cout << "Mesh is empty, cannot unwrap." << std::endl;
-                cudaGraphicsUnmapResources(1, &cudaVBO, 0);
-            }
-        }
-        // -------------------------
 
         // --- CUDA Atlas Pack Trigger (primitive UVs -> single atlas) ---
         if (g_triggerAtlasPack) {
@@ -1686,7 +1471,6 @@ int main() {
             std::cout << "Rebuilding grid with size " << g_gridSize << "..." << std::endl;
             
             // Reset mesh state flags
-            g_isUnwrapped = false;
             g_isAtlasPacked = false;
             g_hasProjectedTexture = false;
             
@@ -1763,8 +1547,8 @@ int main() {
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, view);
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, projection);
         
-        // Texture array binding for Direct Mode (only if valid and not in atlas/unwrapped mode)
-        if (g_useTextureArray && g_textureArrayValid && g_enableUVGeneration && !g_isUnwrapped && !g_isAtlasPacked) {
+        // Texture array binding for Direct Mode (only if valid and not in atlas mode)
+        if (g_useTextureArray && g_textureArrayValid && g_enableUVGeneration && !g_isAtlasPacked) {
             glActiveTexture(GL_TEXTURE1);
             glBindTexture(GL_TEXTURE_2D_ARRAY, g_textureArray);
             glUniform1i(glGetUniformLocation(shaderProgram, "textureArray"), 1);
@@ -1795,24 +1579,14 @@ int main() {
 
         glBindVertexArray(vao);
         
-        if (g_isUnwrapped) {
-            // After unwrap, still use vertex colors unless projection baked
-            if (g_hasProjectedTexture) {
-                glUniform1i(glGetUniformLocation(shaderProgram, "useTexture"), 2);  // Single texture mode
-            } else {
-                glUniform1i(glGetUniformLocation(shaderProgram, "useTexture"), 0);  // SDF color
-            }
-            glDrawElements(GL_TRIANGLES, (GLsizei)g_indexCount, GL_UNSIGNED_INT, 0);
-        } else {
-            // Triangle soup mode - use texture array if enabled and valid
-            if (g_isAtlasPacked) {
-                // Atlas-packed UVs (single atlas texture)
-                glUniform1i(glGetUniformLocation(shaderProgram, "useTexture"), g_hasProjectedTexture ? 2 : 0);
-            } else if (!g_useTextureArray || !g_textureArrayValid || !g_enableUVGeneration) {
-                glUniform1i(glGetUniformLocation(shaderProgram, "useTexture"), 0);  // SDF color
-            }
-            glDrawArrays(GL_TRIANGLES, 0, mesh.GetTotalVertexCount());
+        // Triangle soup mode - use texture array if enabled and valid
+        if (g_isAtlasPacked) {
+            // Atlas-packed UVs (single atlas texture)
+            glUniform1i(glGetUniformLocation(shaderProgram, "useTexture"), g_hasProjectedTexture ? 2 : 0);
+        } else if (!g_useTextureArray || !g_textureArrayValid || !g_enableUVGeneration) {
+            glUniform1i(glGetUniformLocation(shaderProgram, "useTexture"), 0);  // SDF color
         }
+        glDrawArrays(GL_TRIANGLES, 0, mesh.GetTotalVertexCount());
         
         // Debug Draw
         if (g_debugDraw && (g_showBoundingBox || g_showNormals)) {
